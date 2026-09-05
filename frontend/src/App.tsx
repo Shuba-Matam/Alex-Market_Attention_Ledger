@@ -8,7 +8,7 @@ type Item = {
   previous_session_close?: number | null; previous_session_delta_pct?: number | null;
   flagged?: boolean; is_stale?: boolean; data_age_seconds?: number | null;
   source?: string; winning_source?: string; source_conflict?: boolean; conflict?: boolean; conflict_detected?: boolean;
-  source_winner?: string; single_sourced?: boolean;
+  source_winner?: string; single_sourced?: boolean; simulated?: boolean;
   conflict_other_source?: string | null; conflict_other_price_inr?: number | null;
   recent_prices?: number[]; prices?: number[];
 };
@@ -62,24 +62,26 @@ function Row({ item, expanded, onToggle, onDelete }: { item: Item; expanded: boo
   const source = item.source_winner ?? item.winning_source ?? item.source;
   const history = item.recent_prices ?? item.prices ?? [];
   const stale = Boolean(item.is_stale);
-  const status = item.flagged ? "needs attention" : stale ? `data ${ageText(item.data_age_seconds)}` : "stable";
+  const simulated = Boolean(item.simulated);
+  const status = simulated ? "simulated · market closed" : item.flagged ? "needs attention" : stale ? `data ${ageText(item.data_age_seconds)}` : "stable";
   return <article className={`row ${item.flagged ? "flagged" : ""} ${expanded ? "expanded" : ""}`}>
     <button className="row-main" onClick={onToggle} aria-expanded={expanded} aria-controls={`detail-${symbol}`}>
       <span className="symbol"><strong>{symbol}</strong><small className={stale && !item.flagged ? "stale-note" : ""}>{status}</small></span>
       <span className="price">{money(price)}</span>
       <span className="spark-wrap"><Sparkline values={history} /></span>
-      <span className="badges">{item.flagged && <i className="flag">FLAGGED</i>}{stale && <i className="stale">STALE</i>}</span>
+      <span className="badges">{item.flagged && <i className="flag">FLAGGED</i>}{simulated && <i className="sim">SIMULATED</i>}{stale && <i className="stale">STALE</i>}</span>
       <span className="chevron" aria-hidden="true">{expanded ? "−" : "+"}</span>
     </button>
     {expanded && <div className="details" id={`detail-${symbol}`}>
       <dl><div><dt>Since you looked</dt><dd className={(numeric(item.personal_delta_pct) ?? 0) < 0 ? "negative" : "positive"}>{pct(item.personal_delta_pct)}</dd></div><div><dt>Price anomaly</dt><dd>{sigma(item.anomaly_zscore)}</dd></div><div><dt>Volume vs. usual</dt><dd>{ratio(item.volume_spike_ratio)}</dd></div><div><dt>Previous session close</dt><dd>{money(item.previous_session_close)} <small className={(numeric(item.previous_session_delta_pct) ?? 0) < 0 ? "negative" : "positive"}>{pct(item.previous_session_delta_pct)}</small></dd></div></dl>
       <HistoryChart values={history} />
       <div className="provenance">
-        <span>Data: {source || "unknown source"}</span>
-        <span>{ageText(item.data_age_seconds)}</span>
-        {item.conflict_detected && item.conflict_other_source
+        {simulated ? <span className="sim-note">simulated data — this market is closed; a random walk from the last real close keeps the signals alive</span> : <span>Data: {source || "unknown source"}{item.single_sourced ? " (single source)" : ""}</span>}
+        {!simulated && <span>{ageText(item.data_age_seconds)}</span>}
+        {!simulated && item.conflict_detected && item.conflict_other_source
           ? <span className="conflict">sources disagreed: {source} {money(price)} vs {item.conflict_other_source} {money(item.conflict_other_price_inr)} — {source} was fresher</span>
-          : item.single_sourced && source ? <span>single source this cycle</span> : null}
+          : null}
+        {!simulated && item.single_sourced && source ? <span>single source this cycle</span> : null}
         <button onClick={onDelete} className="remove">Remove</button>
       </div>
     </div>}
@@ -131,6 +133,15 @@ export default function App() {
   }, [refresh, user]);
 
   const sorted = useMemo(() => items.map((item, index) => ({ item, index })).sort((a, b) => Number(Boolean(b.item.flagged)) - Number(Boolean(a.item.flagged)) || a.index - b.index), [items]);
+  const digest = useMemo(() => {
+    const withDelta = items.filter((i) => numeric(i.personal_delta_pct) !== null);
+    const flagged = items.filter((i) => i.flagged).length;
+    if (!withDelta.length) return null;
+    const biggest = withDelta.reduce((a, b) => Math.abs(numeric(b.personal_delta_pct)!) > Math.abs(numeric(a.personal_delta_pct)!) ? b : a);
+    const move = numeric(biggest.personal_delta_pct)!;
+    return `${flagged ? `${flagged} of ${items.length} need attention · ` : ""}biggest move since you left: ${biggest.symbol ?? biggest.ticker} ${move > 0 ? "+" : ""}${move.toFixed(2)}%`;
+  }, [items]);
+  const anySimulated = items.some((i) => i.simulated);
   const login = (next: string) => { localStorage.setItem("watch-ledger-user", next); setExpanded(null); setItems([]); setUser(next); };
   const logout = () => { localStorage.removeItem("watch-ledger-user"); setUser(null); setItems([]); setExpanded(null); };
   const action = async (fn: () => Promise<unknown>) => { setBusy(true); try { await fn(); await refresh(true); } catch (e) { setError(e instanceof Error ? e.message : "Action failed."); } finally { setBusy(false); } };
@@ -148,7 +159,7 @@ export default function App() {
       <form onSubmit={addTicker}><label>Add ticker<input value={symbol} onChange={(e) => setSymbol(e.target.value)} placeholder="e.g. RELIANCE" maxLength={12} aria-label="Stock symbol" /></label><button disabled={busy}>Add</button></form>
       <div className="actions"><button onClick={() => void action(() => api.markSeen(user))} disabled={busy || !items.length}>Mark all seen</button><button onClick={() => void action(api.tick)} disabled={busy}>Refresh prices</button></div>
     </section>
-    <section className="ledger" aria-live="polite"><div className="ledger-head"><span>{items.length} watched</span><span>{updated ? `updated ${updated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "connecting…"}</span></div>{loading ? <div className="state">Opening your ledger…</div> : error ? <div className="state error"><strong>Market service unavailable.</strong><span>{error}</span><button onClick={() => void refresh()}>Try again</button></div> : !items.length ? <div className="state"><strong>Your watchlist is empty.</strong><span>Add a ticker to start noticing change, not just prices.</span></div> : <div className="rows">{sorted.map(({ item, index }) => { const key = item.symbol ?? item.ticker ?? String(index); return <Row key={key} item={item} expanded={expanded === key} onToggle={() => setExpanded(expanded === key ? null : key)} onDelete={() => void action(() => api.removeSymbol(user!, key))} />; })}</div>}</section>
-    <footer><span className="dot" /> {stats ? `${stats.unique_symbols} unique symbols tracked across ${stats.users} users — ingestion is deduplicated per symbol, not per viewer. ` : ""}Refreshes every 10 seconds · flag = a personal move &gt;5%, price anomaly &gt;2σ, or volume &gt;2×</footer>
+    <section className="ledger" aria-live="polite"><div className="ledger-head"><span>{items.length} watched</span>{digest && <span className="digest">{digest}</span>}<span>{updated ? `updated ${updated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "connecting…"}</span></div>{loading ? <div className="state">Opening your ledger…</div> : error ? <div className="state error"><strong>Market service unavailable.</strong><span>{error}</span><button onClick={() => void refresh()}>Try again</button></div> : !items.length ? <div className="state"><strong>Your watchlist is empty.</strong><span>Add a ticker to start noticing change, not just prices.</span></div> : <div className="rows">{sorted.map(({ item, index }) => { const key = item.symbol ?? item.ticker ?? String(index); return <Row key={key} item={item} expanded={expanded === key} onToggle={() => setExpanded(expanded === key ? null : key)} onDelete={() => void action(() => api.removeSymbol(user!, key))} />; })}</div>}</section>
+    <footer>{anySimulated && <span className="sim-note">Market asleep: rows marked SIMULATED are generated from the last real close so the change signals keep running — not live prices. </span>}<span className="dot" /> {stats ? `${stats.unique_symbols} unique symbols tracked across ${stats.users} users — ingestion is deduplicated per symbol, not per viewer. ` : ""}Refreshes every 10 seconds · flag = a personal move &gt;5%, price anomaly &gt;2σ, or volume &gt;2×</footer>
   </main>;
 }

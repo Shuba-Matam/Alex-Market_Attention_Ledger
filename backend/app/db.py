@@ -8,9 +8,13 @@ DATABASE_PATH = Path(os.getenv("DATABASE_PATH", Path(__file__).resolve().parents
 
 @contextmanager
 def connection():
-    conn = sqlite3.connect(DATABASE_PATH)
+    # timeout/busy_timeout: the background poller and API handlers write
+    # concurrently; a short lock wait is cheaper than a failed request.
+    conn = sqlite3.connect(DATABASE_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
         yield conn
         conn.commit()
     finally:

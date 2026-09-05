@@ -295,3 +295,16 @@ def is_conflict(inr_a: float, inr_b: float) -> bool:
     if denominator == 0:
         return False
     return abs(inr_a - inr_b) / denominator * 100 > conflict_threshold_pct()
+
+
+MARKET_ASLEEP_AFTER_SECONDS = int(os.getenv("MARKET_ASLEEP_AFTER_SECONDS", "1800"))
+
+
+def market_is_asleep(quote: Quote) -> bool:
+    """True when the provider's last market event is far behind the wall clock.
+
+    regularMarketTime only advances while a market trades, so a timestamp many
+    minutes stale means that symbol's market is closed (night, weekend, holiday)
+    without needing a per-exchange calendar.
+    """
+    return quote.timestamp < int(time.time()) - MARKET_ASLEEP_AFTER_SECONDS

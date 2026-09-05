@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import random
 import statistics
 import time
 from typing import Optional
@@ -7,11 +9,13 @@ from typing import Optional
 from .db import connection
 from .providers import (
     FxRateProvider,
+    Quote,
     TwelveDataProvider,
     YahooChartProvider,
     choose_freshest,
     convert_to_inr,
     is_conflict,
+    market_is_asleep,
 )
 
 PERSONAL_DELTA_THRESHOLD = 5.0
@@ -20,6 +24,7 @@ VOLUME_SPIKE_THRESHOLD = 2.0
 MAX_SNAPSHOTS_PER_SYMBOL = 100
 STALE_AFTER_SECONDS = 45
 MIN_HISTORY = 5
+SIMULATION_ENABLED = os.getenv("SIMULATE_WHEN_MARKET_CLOSED", "1") != "0"
 
 
 def format_inr(amount: Optional[float]) -> Optional[str]:
@@ -42,8 +47,9 @@ def normalize_symbol(symbol: str) -> str:
     value = symbol.strip().upper()
     if value.endswith(".NS"):
         value = value[:-3]
-    if not value or len(value) > 15 or not all(c.isalnum() or c in ".-" for c in value):
-        raise ValueError("symbol must be 1-15 letters, numbers, dots, or hyphens")
+    # '&' appears in real NSE tickers (M&M, L&TFH) — reject only clearly invalid input.
+    if not value or len(value) > 15 or not all(c.isalnum() or c in ".-&" for c in value):
+        raise ValueError("symbol must be 1-15 letters, numbers, dots, hyphens, or ampersands")
     return value
 
 
@@ -104,6 +110,20 @@ def remove_symbol(username: str, symbol: str) -> bool:
         return conn.execute("DELETE FROM watchlist_items WHERE username=? AND symbol=?", (username, normalize_symbol(symbol))).rowcount > 0
 
 
+def _simulate_quote(symbol: str, last: Optional[object]) -> Quote:
+    """A clearly-labelled random walk from the last real INR price, used only while
+    that symbol's market is closed. Generated rows carry source='simulated' so the
+    UI can disclaim them; they are never blended with live sources."""
+    last_inr = last["price_inr"] if last and last["price_inr"] else None
+    base = last_inr if last_inr and last_inr > 0 else 100.0
+    price = max(0.05, round(base * (1 + random.gauss(0, 0.004)), 2))
+    base_volume = last["volume"] if last and last["volume"] else random.randint(500_000, 5_000_000)
+    volume = int(base_volume * random.uniform(0.75, 1.35))
+    previous_close = last["previous_close_inr"] if last else None
+    return Quote(symbol=symbol, price=price, volume=volume, timestamp=int(time.time()),
+                 source="simulated", currency="INR", previous_close=previous_close)
+
+
 def tick(symbol: Optional[str] = None) -> list[dict]:
     """Poll live sources once for each watchlisted symbol and persist the resolved INR quote.
 
@@ -131,6 +151,16 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
             result.append({"symbol": item, "updated": False, "reason": "no source responded"})
             continue
 
+        # Market asleep (night/weekend/holiday): replace live candidates with a
+        # clearly-labelled simulated walk so the change signals keep running.
+        # Every generated row keeps source='simulated' end to end.
+        if SIMULATION_ENABLED and all(market_is_asleep(q) for q in candidates):
+            with connection() as conn:
+                last = conn.execute(
+                    "SELECT price_inr, volume, previous_close_inr FROM price_snapshots WHERE symbol=? ORDER BY fetched_at DESC, id DESC LIMIT 1",
+                    (item,)).fetchone()
+            candidates = [_simulate_quote(item, last)]
+
         converted = {quote.source: convert_to_inr(quote.price, quote.currency, usd_to_inr) for quote in candidates}
         conflict = len(candidates) > 1 and is_conflict(converted[candidates[0].source], converted[candidates[1].source])
         if conflict:
@@ -146,6 +176,7 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
         previous_close = winner.previous_close
         previous_close_inr = convert_to_inr(previous_close, winner.currency, usd_to_inr) if previous_close is not None else None
         sources = ",".join(sorted(q.source for q in candidates))
+        simulated = winner.source == "simulated"
         with connection() as conn:
             conn.execute("INSERT OR IGNORE INTO symbols(symbol, created_at) VALUES (?, ?)", (item, now))
             conn.execute("""INSERT INTO price_snapshots(symbol, price, native_currency, price_inr, usd_to_inr,
@@ -155,7 +186,7 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                          (item, winner.price, winner.currency, winner_inr, usd_to_inr,
                           previous_close, previous_close_inr, winner.volume, winner.timestamp, now, winner.source,
-                          winner.source if conflict else "", sources, int(conflict), int(len(candidates) == 1),
+                          winner.source if conflict else "", sources, int(conflict), int(len(candidates) == 1 and not simulated),
                           loser_source, loser_inr))
             conn.execute("""DELETE FROM price_snapshots WHERE id IN (
                             SELECT id FROM price_snapshots WHERE symbol=?
@@ -164,7 +195,8 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
         result.append({"symbol": item, "updated": True, "price_inr": winner_inr, "native_price": winner.price,
                        "native_currency": winner.currency, "source_winner": winner.source,
                        "candidate_sources": sources, "conflict_detected": conflict,
-                       "single_sourced": len(candidates) == 1})
+                       "single_sourced": len(candidates) == 1 and not simulated,
+                       "simulated": simulated})
     return result
 
 
@@ -212,7 +244,7 @@ def watchlist(username: str) -> list[dict]:
                 result.append({"symbol": item["symbol"], "price": None, "volume": None, "source": None,
                                "provider_timestamp": None, "candidate_sources": [], "conflict_detected": False,
                                "single_sourced": True, "conflict_other_source": None,
-                               "conflict_other_price_inr": None,
+                               "conflict_other_price_inr": None, "simulated": False,
                                "recent_prices": [], "personal_delta_pct": None,
                                "anomaly_zscore": None, "volume_spike_ratio": None, "flagged": False,
                                "data_age_seconds": None, "is_stale": True})
@@ -238,6 +270,7 @@ def watchlist(username: str) -> list[dict]:
                            "candidate_sources": latest["candidate_sources"].split(","),
                            "conflict_detected": bool(latest["conflict_detected"]),
                            "single_sourced": bool(latest["single_sourced"]),
+                           "simulated": latest["source"] == "simulated",
                            "conflict_other_source": latest["conflict_other_source"] or None,
                            "conflict_other_price_inr": latest["conflict_other_price_inr"],
                            "recent_prices": list(reversed([r["price_inr"] for r in snapshots])),

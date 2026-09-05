@@ -9,5 +9,8 @@
 .user-picker strong{font-size:1rem;letter-spacing:.03em}
 .user-picker small{font-size:.61rem;color:#667467}
 .stale-note{color:#775d11}
+.sim{color:#4a3a78;background:#e2dcf3}
+.sim-note{color:#4a3a78}
+.digest{color:#27392e;font-weight:600}
 .history-chart{margin:.4rem 0 1rem;border:1px dashed #bac1b7;background:#fbfaf4;padding:.4rem 0}
 .no-history{font-size:.64rem;color:#7a8578;margin:.6rem;padding:.4rem 0}

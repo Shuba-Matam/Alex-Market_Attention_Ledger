@@ -27,8 +27,10 @@ def _fresh_db(monkeypatch):
     path = Path(directory.name) / "test.db"
     os.environ["DATABASE_PATH"] = str(path)
     # DATABASE_PATH is a module constant read at import; repoint it per test.
-    from app import db
+    from app import db, service
     monkeypatch.setattr(db, "DATABASE_PATH", path)
+    # Most tests model an awake market; the simulation test re-enables it explicitly.
+    monkeypatch.setattr(service, "SIMULATION_ENABLED", False)
     return directory
 
 
@@ -226,6 +228,58 @@ def test_stale_provider_timestamps_cannot_hijack_latest_snapshot(monkeypatch):
                 count = conn.execute(
                     "SELECT COUNT(*) AS n FROM price_snapshots WHERE symbol='RELIANCE'").fetchone()["n"]
             assert count == 100  # cap holds, but by insertion order, not provider time
+
+
+def test_market_closed_symbols_get_labelled_simulated_ticks(monkeypatch):
+    """When the provider's last market event is stale (NSE closed overnight), the
+    poller runs a random walk from the last real close, tagged source='simulated'
+    so the UI can disclaim it. Awake symbols keep real data."""
+    with _fresh_db(monkeypatch):
+        from app.main import app
+        from app import providers, service
+
+        _mock_fx(monkeypatch)
+        monkeypatch.setattr(service, "SIMULATION_ENABLED", True)
+        with TestClient(app) as client:
+            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+            # Market open: a real quote, recent timestamp.
+            monkeypatch.setattr(providers.YahooChartProvider, "quote",
+                                lambda self, symbol: _quote(1420.0, int(time.time()), previous_close=1400.0))
+            client.post("/poll", json={"symbol": "RELIANCE"})
+            data = client.get("/watchlist/alice").json()["items"][0]
+            assert data["simulated"] is False and data["source"] == "yahoo"
+            baseline = data["price"]
+            # Market asleep: same price, hours-old market timestamp.
+            monkeypatch.setattr(providers.YahooChartProvider, "quote",
+                                lambda self, symbol: _quote(1420.0, int(time.time()) - 7_200))
+            client.post("/poll", json={"symbol": "RELIANCE"})
+            data = client.get("/watchlist/alice").json()["items"][0]
+            assert data["simulated"] is True
+            assert data["source"] == "simulated"
+            # The walk starts from the last real close, not from thin air.
+            assert 0.9 * baseline <= data["price"] <= 1.1 * baseline
+            # Provenance must not claim live agreement or conflict for simulated rows.
+            assert data["conflict_detected"] is False
+            assert data["single_sourced"] is False
+
+
+def test_tickers_with_ampersand_are_valid(monkeypatch):
+    """M&M is a real NSE ticker; validation must not reject ampersands."""
+    from app.service import normalize_symbol
+
+    assert normalize_symbol("m&m") == "M&M"
+
+    with _fresh_db(monkeypatch):
+        from app.main import app
+        from app import providers
+
+        _mock_fx(monkeypatch)
+        monkeypatch.setattr(providers.YahooChartProvider, "quote",
+                            lambda self, symbol: _quote(3200.0, int(time.time())))
+        with TestClient(app) as client:
+            response = client.post("/watchlist/alice/symbols", json={"symbol": "M&M"})
+            assert response.status_code == 201
+            assert response.json()["symbol"] == "M&M"
 
 
 def test_format_inr_uses_indian_grouping():

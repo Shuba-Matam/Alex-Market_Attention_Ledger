@@ -9,12 +9,23 @@ from pydantic import BaseModel, Field
 
 from .db import connection, init_db
 from .providers import YahooChartProvider
-from .service import add_symbol, initialize_seen_price, mark_seen, remove_symbol, tick, watchlist
+from .service import (
+    add_symbol,
+    initialize_seen_price,
+    list_users,
+    mark_seen,
+    remove_symbol,
+    seed_users,
+    stats,
+    tick,
+    watchlist,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    seed_users()
     interval = max(1, int(os.getenv("POLL_INTERVAL_SECONDS", "15")))
     stop = asyncio.Event()
 
@@ -55,7 +66,9 @@ def _has_any_data(symbol: str) -> bool:
 
 
 app = FastAPI(title="Signal Watchlist API", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+_allowed_origins = [origin.strip() for origin in os.getenv(
+    "ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if origin.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=_allowed_origins,
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
@@ -70,6 +83,17 @@ class PollBody(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/users")
+def get_users():
+    """Seeded dummy accounts for the login screen."""
+    return {"users": list_users()}
+
+
+@app.get("/stats")
+def get_stats():
+    return stats()
 
 
 @app.get("/watchlist/{username}")

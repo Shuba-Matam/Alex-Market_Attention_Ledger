@@ -1,0 +1,23 @@
+# Render free-tier deployment for the backend.
+# NOTE on free tier: the service sleeps after ~15 min without traffic (the
+# background poller only runs while awake) and SQLite lives on an ephemeral
+# disk — data survives restarts of the running service but is reset on
+# redeploy. Attach a paid persistent disk (or use Railway volumes) if the
+# demo must survive redeploys.
+services:
+  - type: web
+    name: watchme-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TWELVE_DATA_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false   # set to your deployed frontend URL, e.g. https://watchme.vercel.app
+      - key: POLL_INTERVAL_SECONDS
+        value: "15"
+      - key: FX_REFRESH_SECONDS
+        value: "300"

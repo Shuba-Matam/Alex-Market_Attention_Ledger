@@ -4,18 +4,16 @@ An attention-first market watchlist built for Groww Code 2026. It answers **what
 
 ## What it does
 
-- Persists username-scoped watchlists in SQLite.
-- Ingests a distinct symbol once every 15 seconds, not once per browser session.
-- Shows three independent, explainable signals: change since last seen, price anomaly z-score, and volume versus its rolling average.
-- Flags a symbol when any signal crosses its named threshold; it never hides the reason inside a blended score.
-- Keeps the latest 100 snapshots per symbol and returns the latest 20 for an inline sparkline.
-- Makes data age, source, and a resolved multi-source conflict visible in the UI.
-- Uses yfinance for live NSE OHLCV data (`RELIANCE` is queried as `RELIANCE.NS`) and falls back to deterministic synthetic data when it is unavailable.
-- Runs with no API key through a deterministic synthetic provider, including price-jump and volume-spike demo scenarios.
+- Persists per-user watchlists in SQLite; login is a picker over seeded dummy accounts — the thing being demonstrated is per-user state persistence, not security.
+- **Two live sources, no synthetic data**: Yahoo Finance's keyless chart endpoint is primary; Twelve Data (`/quote`, free tier, throttled to ~800 requests/day) cross-checks when an API key is set. Bare NSE tickers are retried with `.NS` automatically.
+- **Everything is displayed in INR.** Quotes are stored in their native currency and converted once at the API boundary using a cached live USD/INR rate (`INR=X`, refreshed every 5 minutes — FX doesn't need 15-second freshness). NSE quotes are never double-converted.
+- **Conflict handling is real and visible.** When both sources respond, both are converted to INR first, then compared. A spread beyond 0.5% is a real conflict: the fresher timestamp wins, and the expanded row shows both disagreeing values and which source was used. A lone source is marked single-sourced, not silently agreed-upon.
+- Three independent, explainable signals per row: change since last seen, price anomaly z-score, and volume versus its rolling average. A row is flagged when any signal crosses its named threshold — never via a blended score.
+- Expanded rows show a recharts line graph of recent price history plus staleness ("data is Xs old") and full source provenance.
+- A footer stat ("N unique symbols tracked across M users") is the demoable proof that ingestion is deduplicated per symbol, not per user-per-symbol — the actual scaling lever.
+- Symbols poll every 15 seconds via a background worker, deduplicated across users; the UI refreshes every 10 seconds.
 
-## Run it
-
-Open two PowerShell windows from this project root.
+## Run it locally
 
 ```powershell
 cd backend
@@ -27,16 +25,21 @@ cd frontend
 npm run dev
 ```
 
-Visit the Vite URL printed in the second terminal (normally `http://localhost:5173`). Add a ticker, select **Mark all seen**, then select **Simulate activity** a few times to make the signals and sparkline evolve.
+Visit `http://localhost:5173`, pick an account, add tickers (NSE names like `RELIANCE` and US names like `AAPL` both work), select **Mark all seen**, then compare after the next poll.
 
-Live NSE OHLCV data is attempted through yfinance without an API key. Twelve Data remains an optional additional source:
+Optional secondary source:
 
 ```powershell
 $env:TWELVE_DATA_API_KEY="your-key"
 .\.venv\Scripts\python -m uvicorn app.main:app --reload
 ```
 
-The application still works without this key. The winning source and conflicts are exposed in each watchlist response.
+The app is fully functional without the key — rows are simply single-sourced (and labelled as such).
+
+## Deploy
+
+- **Backend**: `render.yaml` deploys to Render's free tier (`pip install` + `uvicorn`). Two honest caveats, documented in that file: free-tier services sleep after ~15 minutes without traffic (the background poller only runs while awake), and SQLite sits on an ephemeral disk — data survives a running service's restarts but is reset on redeploy. Attach a persistent disk (paid) or Railway volumes if the demo must survive redeploys. Set `TWELVE_DATA_API_KEY` and `ALLOWED_ORIGINS` (your frontend URL) in the dashboard.
+- **Frontend**: deploy `frontend/` to Vercel or Netlify (near-zero-config for Vite) and set `VITE_API_BASE` to the deployed backend URL — the API base has been an environment variable from the start (`frontend/.env.example`).
 
 ## Verification
 
@@ -50,8 +53,10 @@ npm run build
 
 ## Submission trade-offs
 
-**Polling instead of streaming.** A 15-second backend poller and 10-second UI refresh give predictable, debuggable behaviour in a 72-hour build. The provider interface and cached snapshots isolate ingestion so WebSockets can replace polling later without changing the API or UI. Symbols are deduplicated across users before ingestion.
+**Polling instead of streaming.** A 15-second backend poller and 10-second UI refresh give predictable, debuggable behaviour in a 72-hour build. The provider interface and cached snapshots isolate ingestion so WebSockets can replace polling later without changing the API or UI. Symbols are deduplicated across users before ingestion — the footer stat makes that lever visible.
 
-**Resilience without pretending.** The synthetic source is deliberately a deterministic demo/resilience provider, not falsely described as live market data. yfinance provides live NSE OHLCV, and Twelve Data is an optional additional source. When sources report, the freshest provider timestamp wins, a fixed source-priority rule breaks ties, and the result retains provenance. Failure leaves the latest persisted data visible and eventually marked stale.
+**Resilience without pretending.** The freshest provider timestamp wins conflicts, a fixed source-priority rule breaks ties, and the result retains provenance. Total source failure leaves the latest persisted data visible and eventually marked stale; single-source polls are labelled rather than passed off as verified.
+
+**Dummy auth.** A user picker over seeded rows instead of passwords: nothing in this project needs protecting, and the point being demonstrated is per-user persistence across sessions and devices.
 
 **No AI feature.** Every alert is deterministic and auditable. The UI shows the exact signal that caused the flag, avoiding opaque or investment-advice-like recommendations.

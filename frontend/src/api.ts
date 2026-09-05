@@ -14,6 +14,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  users: () => request<{ users: string[] }>("/users"),
+  stats: () => request<{ unique_symbols: number; users: number }>("/stats"),
   watchlist: (username: string) => request<unknown>(`/watchlist/${encodeURIComponent(username)}`),
   addSymbol: (username: string, symbol: string) => request<unknown>(`/watchlist/${encodeURIComponent(username)}/symbols`, { method: "POST", body: JSON.stringify({ symbol }) }),
   removeSymbol: (username: string, symbol: string) => request<unknown>(`/watchlist/${encodeURIComponent(username)}/symbols/${encodeURIComponent(symbol)}`, { method: "DELETE" }),

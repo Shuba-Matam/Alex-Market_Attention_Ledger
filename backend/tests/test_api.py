@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -82,6 +83,9 @@ def test_conflict_prefers_fresher_timestamp_and_records_winner(monkeypatch):
             assert updates["price_inr"] == 102.0
             data = client.get("/watchlist/alice").json()["items"][0]
             assert data["source_winner"] == "twelve_data"
+            # Section 4: both disagreeing values are exposed, not just the winner.
+            assert data["conflict_other_source"] == "yahoo"
+            assert data["conflict_other_price_inr"] == 100.0
 
 
 def test_agreeing_sources_are_not_a_conflict(monkeypatch):
@@ -134,6 +138,94 @@ def test_unknown_ticker_is_rejected(monkeypatch):
         with TestClient(app) as client:
             response = client.post("/watchlist/alice/symbols", json={"symbol": "NVDIA"})
             assert response.status_code == 422
+
+
+def test_seeded_users_and_stats(monkeypatch):
+    with _fresh_db(monkeypatch):
+        from app.main import app
+
+        with TestClient(app) as client:
+            users = client.get("/users").json()["users"]
+            assert {"demo", "aarav", "priya", "rohan"} <= set(users)
+            # Seeding is idempotent.
+            with TestClient(app) as again:
+                assert again.get("/users").json()["users"] == users
+            assert client.get("/stats").json()["users"] == len(users)
+
+            from app import providers
+            _mock_fx(monkeypatch)
+            monkeypatch.setattr(providers.YahooChartProvider, "quote",
+                                lambda self, symbol: _quote(1420.0, 1000))
+            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+            client.post("/watchlist/bob/symbols", json={"symbol": "RELIANCE"})
+            stats = client.get("/stats").json()
+            # One symbol watched by two users counts once — dedup proof.
+            assert stats["unique_symbols"] == 1
+
+
+def test_yahoo_prefers_nse_for_dual_listed_tickers(monkeypatch):
+    """INFY exists on both NSE (Infosys Ltd) and NYSE (the ADR). India-first
+    means the NSE listing must win; US-only tickers still resolve."""
+    from app import providers
+
+    fetched = []
+
+    def fake_fetch(market_symbol):
+        fetched.append(market_symbol)
+        if market_symbol == "INFY.NS":
+            return {"meta": {"regularMarketPrice": 1500.0, "currency": "INR", "regularMarketTime": 1000}}
+        if market_symbol == "INFY":
+            return {"meta": {"regularMarketPrice": 11.7, "currency": "USD", "regularMarketTime": 1000}}
+        if market_symbol == "AAPL":
+            return {"meta": {"regularMarketPrice": 319.97, "currency": "USD", "regularMarketTime": 1000}}
+        return None  # e.g. AAPL.NS does not exist
+
+    monkeypatch.setattr(providers.YahooChartProvider, "_fetch", staticmethod(fake_fetch))
+    monkeypatch.setattr(providers.YahooChartProvider, "_SUFFIX_CACHE", {})
+
+    provider = providers.YahooChartProvider()
+    nse = provider.quote("INFY")
+    assert nse.currency == "INR" and nse.price == 1500.0
+
+    usd = provider.quote("AAPL")
+    assert usd.currency == "USD" and usd.price == 319.97
+
+    # Resolution is cached: a repeat poll does not re-probe both suffixes.
+    fetched.clear()
+    provider.quote("INFY")
+    assert fetched == ["INFY.NS"]
+
+
+def test_stale_provider_timestamps_cannot_hijack_latest_snapshot(monkeypatch):
+    """Regression: a listing change (e.g. INFY resolving NSE instead of the US ADR)
+    produces fresh rows with an OLDER provider_timestamp. Retention and the read
+    path must not let stored rows delete or hide genuinely newer fetches."""
+    with _fresh_db(monkeypatch):
+        from app.main import app
+        from app import providers
+        from app.db import connection
+
+        _mock_fx(monkeypatch)
+        monkeypatch.setattr(providers.YahooChartProvider, "quote",
+                            lambda self, symbol: _quote(1130.0, 1000))
+        with TestClient(app) as client:
+            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+            now = int(time.time())
+            with connection() as conn:
+                for i in range(100):
+                    conn.execute(
+                        """INSERT INTO price_snapshots(symbol, price, native_currency, price_inr,
+                           provider_timestamp, fetched_at, source)
+                           VALUES ('RELIANCE', 11.7, 'USD', 1105.5, 99999, ?, 'yahoo')""",
+                        (now - i,))
+            client.post("/poll", json={"symbol": "RELIANCE"})
+            data = client.get("/watchlist/alice").json()["items"][0]
+            # The newest fetch wins even though its provider timestamp is older.
+            assert data["price"] == 1130.0
+            with connection() as conn:
+                count = conn.execute(
+                    "SELECT COUNT(*) AS n FROM price_snapshots WHERE symbol='RELIANCE'").fetchone()["n"]
+            assert count == 100  # cap holds, but by insertion order, not provider time
 
 
 def test_format_inr_uses_indian_grouping():

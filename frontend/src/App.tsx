@@ -1,4 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { Line, LineChart, ResponsiveContainer, YAxis } from "recharts";
 import { api } from "./api";
 
 type Item = {
@@ -8,15 +9,19 @@ type Item = {
   flagged?: boolean; is_stale?: boolean; data_age_seconds?: number | null;
   source?: string; winning_source?: string; source_conflict?: boolean; conflict?: boolean; conflict_detected?: boolean;
   source_winner?: string; single_sourced?: boolean;
+  conflict_other_source?: string | null; conflict_other_price_inr?: number | null;
   recent_prices?: number[]; prices?: number[];
 };
 
-const defaultUser = localStorage.getItem("watch-ledger-user") || "demo";
+type Stats = { unique_symbols: number; users: number };
+
 const numeric = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : null;
 const pct = (value: unknown) => numeric(value) === null ? "—" : `${numeric(value)!.toFixed(2)}%`;
 const ratio = (value: unknown) => numeric(value) === null ? "—" : `${numeric(value)!.toFixed(2)}×`;
+const sigma = (value: unknown) => numeric(value) === null ? "—" : `${numeric(value)!.toFixed(2)}σ`;
 const inr = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const money = (value: unknown) => numeric(value) === null ? "—" : inr.format(numeric(value)!);
+const ageText = (value: unknown) => numeric(value) === null ? "age unavailable" : `${Math.round(numeric(value)!)}s old`;
 
 function normalize(payload: unknown): Item[] {
   if (Array.isArray(payload)) return payload as Item[];
@@ -25,6 +30,21 @@ function normalize(payload: unknown): Item[] {
     for (const key of ["items", "watchlist", "symbols", "data"]) if (Array.isArray(record[key])) return record[key] as Item[];
   }
   return [];
+}
+
+function HistoryChart({ values }: { values: number[] }) {
+  const points = values.filter((v) => Number.isFinite(v));
+  if (points.length < 2) return <p className="no-history">Not enough history yet — the poller is collecting it.</p>;
+  const data = points.map((price, index) => ({ index, price }));
+  const up = points.at(-1)! >= points[0];
+  return <div className="history-chart">
+    <ResponsiveContainer width="100%" height={130}>
+      <LineChart data={data} margin={{ top: 8, right: 8, bottom: 4, left: 8 }}>
+        <YAxis domain={["auto", "auto"]} hide />
+        <Line type="monotone" dataKey="price" stroke={up ? "#24734f" : "#b64a3a"} strokeWidth={1.7} dot={false} isAnimationActive={false} />
+      </LineChart>
+    </ResponsiveContainer>
+  </div>;
 }
 
 function Sparkline({ values }: { values: number[] }) {
@@ -39,37 +59,96 @@ function Sparkline({ values }: { values: number[] }) {
 function Row({ item, expanded, onToggle, onDelete }: { item: Item; expanded: boolean; onToggle: () => void; onDelete: () => void }) {
   const symbol = item.symbol ?? item.ticker ?? "UNKNOWN";
   const price = item.current_price ?? item.price;
-  const source = item.winning_source ?? item.source;
+  const source = item.source_winner ?? item.winning_source ?? item.source;
   const history = item.recent_prices ?? item.prices ?? [];
-  const stale = item.is_stale;
-  const conflict = item.source_conflict ?? item.conflict ?? item.conflict_detected;
+  const stale = Boolean(item.is_stale);
+  const status = item.flagged ? "needs attention" : stale ? `data ${ageText(item.data_age_seconds)}` : "stable";
   return <article className={`row ${item.flagged ? "flagged" : ""} ${expanded ? "expanded" : ""}`}>
     <button className="row-main" onClick={onToggle} aria-expanded={expanded} aria-controls={`detail-${symbol}`}>
-      <span className="symbol"><strong>{symbol}</strong><small>{item.flagged ? "needs attention" : "stable"}</small></span>
+      <span className="symbol"><strong>{symbol}</strong><small className={stale && !item.flagged ? "stale-note" : ""}>{status}</small></span>
       <span className="price">{money(price)}</span>
       <span className="spark-wrap"><Sparkline values={history} /></span>
       <span className="badges">{item.flagged && <i className="flag">FLAGGED</i>}{stale && <i className="stale">STALE</i>}</span>
       <span className="chevron" aria-hidden="true">{expanded ? "−" : "+"}</span>
     </button>
     {expanded && <div className="details" id={`detail-${symbol}`}>
-      <dl><div><dt>Since you looked</dt><dd className={(numeric(item.personal_delta_pct) ?? 0) < 0 ? "negative" : "positive"}>{pct(item.personal_delta_pct)}</dd></div><div><dt>Price anomaly</dt><dd>{numeric(item.anomaly_zscore) === null ? "—" : `${numeric(item.anomaly_zscore)!.toFixed(2)}σ`}</dd></div><div><dt>Volume vs. usual</dt><dd>{ratio(item.volume_spike_ratio)}</dd></div><div><dt>Previous session close</dt><dd>{money(item.previous_session_close)} <small className={(numeric(item.previous_session_delta_pct) ?? 0) < 0 ? "negative" : "positive"}>{pct(item.previous_session_delta_pct)}</small></dd></div></dl>
-      <div className="provenance"><span>Data: {source || "unknown source"}{item.single_sourced ? " (single source)" : ""}</span>{item.source_winner && item.conflict_detected ? <span className="conflict">conflict — {item.source_winner} was fresher</span> : null}<span>{numeric(item.data_age_seconds) === null ? "age unavailable" : `${Math.round(item.data_age_seconds!)}s old`}</span><button onClick={onDelete} className="remove">Remove</button></div>
+      <dl><div><dt>Since you looked</dt><dd className={(numeric(item.personal_delta_pct) ?? 0) < 0 ? "negative" : "positive"}>{pct(item.personal_delta_pct)}</dd></div><div><dt>Price anomaly</dt><dd>{sigma(item.anomaly_zscore)}</dd></div><div><dt>Volume vs. usual</dt><dd>{ratio(item.volume_spike_ratio)}</dd></div><div><dt>Previous session close</dt><dd>{money(item.previous_session_close)} <small className={(numeric(item.previous_session_delta_pct) ?? 0) < 0 ? "negative" : "positive"}>{pct(item.previous_session_delta_pct)}</small></dd></div></dl>
+      <HistoryChart values={history} />
+      <div className="provenance">
+        <span>Data: {source || "unknown source"}</span>
+        <span>{ageText(item.data_age_seconds)}</span>
+        {item.conflict_detected && item.conflict_other_source
+          ? <span className="conflict">sources disagreed: {source} {money(price)} vs {item.conflict_other_source} {money(item.conflict_other_price_inr)} — {source} was fresher</span>
+          : item.single_sourced && source ? <span>single source this cycle</span> : null}
+        <button onClick={onDelete} className="remove">Remove</button>
+      </div>
     </div>}
   </article>;
 }
 
+function LoginScreen({ users, onPick }: { users: string[]; onPick: (user: string) => void }) {
+  return <main className="login">
+    <header><p className="eyebrow">Market attention ledger</p><h1>Who is<br /><em>checking in?</em></h1>
+      <p className="lede">Pick an account to open its ledger. State persists per user — what you marked seen stays seen.</p></header>
+    <section className="user-picker" aria-label="Accounts">
+      {users.length
+        ? users.map((user) => <button key={user} onClick={() => onPick(user)}><strong>{user}</strong><small>open ledger →</small></button>)
+        : <p className="lede">Loading accounts…</p>}
+    </section>
+    <footer>Demo accounts by design — nothing here needs a password, and each ledger is independent.</footer>
+  </main>;
+}
+
 export default function App() {
-  const [username, setUsername] = useState(defaultUser), [draftUser, setDraftUser] = useState(defaultUser), [symbol, setSymbol] = useState("");
+  const [user, setUser] = useState<string | null>(() => localStorage.getItem("watch-ledger-user"));
+  const [accounts, setAccounts] = useState<string[]>([]);
+  const [symbol, setSymbol] = useState("");
   const [items, setItems] = useState<Item[]>([]), [expanded, setExpanded] = useState<string | null>(null), [loading, setLoading] = useState(true), [error, setError] = useState("");
-  const [busy, setBusy] = useState(false), [updated, setUpdated] = useState<Date | null>(null);
-  const refresh = useCallback(async (quiet = false) => { if (!quiet) setLoading(true); try { setItems(normalize(await api.watchlist(username))); setError(""); setUpdated(new Date()); } catch (e) { setError(e instanceof Error ? e.message : "Unable to reach the market service."); } finally { if (!quiet) setLoading(false); } }, [username]);
-  useEffect(() => { void refresh(); const id = window.setInterval(() => void refresh(true), 10_000); return () => window.clearInterval(id); }, [refresh]);
+  const [busy, setBusy] = useState(false), [updated, setUpdated] = useState<Date | null>(null), [stats, setStats] = useState<Stats | null>(null);
+
+  useEffect(() => {
+    if (user) return;
+    api.users().then((res) => setAccounts(res.users)).catch(() => setAccounts([]));
+  }, [user]);
+
+  const refresh = useCallback(async (quiet = false) => {
+    if (!user) return;
+    if (!quiet) setLoading(true);
+    try {
+      const [watchlist, statResult] = await Promise.all([api.watchlist(user), api.stats().catch(() => null)]);
+      setItems(normalize(watchlist));
+      if (statResult) setStats(statResult);
+      setError(""); setUpdated(new Date());
+    } catch (e) { setError(e instanceof Error ? e.message : "Unable to reach the market service."); }
+    finally { if (!quiet) setLoading(false); }
+  }, [user]);
+
+  useEffect(() => {
+    if (!user) return;
+    void refresh();
+    const id = window.setInterval(() => void refresh(true), 10_000);
+    return () => window.clearInterval(id);
+  }, [refresh, user]);
+
   const sorted = useMemo(() => items.map((item, index) => ({ item, index })).sort((a, b) => Number(Boolean(b.item.flagged)) - Number(Boolean(a.item.flagged)) || a.index - b.index), [items]);
-  const changeUser = (e: FormEvent) => { e.preventDefault(); const next = draftUser.trim(); if (!next) return; localStorage.setItem("watch-ledger-user", next); setUsername(next); setExpanded(null); };
+  const login = (next: string) => { localStorage.setItem("watch-ledger-user", next); setExpanded(null); setItems([]); setUser(next); };
+  const logout = () => { localStorage.removeItem("watch-ledger-user"); setUser(null); setItems([]); setExpanded(null); };
   const action = async (fn: () => Promise<unknown>) => { setBusy(true); try { await fn(); await refresh(true); } catch (e) { setError(e instanceof Error ? e.message : "Action failed."); } finally { setBusy(false); } };
-  return <main><header><p className="eyebrow">Market attention ledger</p><h1>What changed<br /><em>while you were away?</em></h1><p className="lede">Signals are personal: change since <b>{username}</b> last checked, unusual price movement, and unusual volume.</p>{username === "demo" && <p className="lede"><small>Live quotes from Yahoo Finance, cross-checked against Twelve Data when a key is configured. All prices shown in INR.</small></p>}</header>
-    <section className="toolbar"><form onSubmit={changeUser}><label>Viewing as<input value={draftUser} onChange={(e) => setDraftUser(e.target.value)} aria-label="Username" /></label><button>Switch</button></form><form onSubmit={(e) => { e.preventDefault(); const next = symbol.trim().toUpperCase(); if (next) void action(() => api.addSymbol(username, next)); setSymbol(""); }}><label>Add ticker<input value={symbol} onChange={(e) => setSymbol(e.target.value)} placeholder="e.g. RELIANCE" maxLength={12} aria-label="Stock symbol" /></label><button disabled={busy}>Add</button></form><div className="actions"><button onClick={() => void action(() => api.markSeen(username))} disabled={busy || !items.length}>Mark all seen</button><button onClick={() => void action(api.tick)} disabled={busy}>Refresh prices</button></div></section>
-    <section className="ledger" aria-live="polite"><div className="ledger-head"><span>{items.length} watched</span><span>{updated ? `updated ${updated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "connecting…"}</span></div>{loading ? <div className="state">Opening your ledger…</div> : error ? <div className="state error"><strong>Market service unavailable.</strong><span>{error}</span><button onClick={() => void refresh()}>Try again</button></div> : !items.length ? <div className="state"><strong>Your watchlist is empty.</strong><span>Add a ticker to start noticing change, not just prices.</span></div> : <div className="rows">{sorted.map(({ item, index }) => { const key = item.symbol ?? item.ticker ?? String(index); return <Row key={key} item={item} expanded={expanded === key} onToggle={() => setExpanded(expanded === key ? null : key)} onDelete={() => void action(() => api.removeSymbol(username, key))} />; })}</div>}</section>
-    <footer>Refreshes every 10 seconds · <span className="dot" /> flag = a personal move &gt;5%, price anomaly &gt;2σ, or volume &gt;2×</footer>
+  const addTicker = (e: FormEvent) => { e.preventDefault(); const next = symbol.trim().toUpperCase(); if (next) void action(() => api.addSymbol(user!, next)); setSymbol(""); };
+
+  if (!user) return <LoginScreen users={accounts} onPick={login} />;
+
+  return <main><header>
+    <p className="eyebrow">Market attention ledger</p>
+    <h1>What changed<br /><em>while you were away?</em></h1>
+    <p className="lede">Signals are personal: change since <b>{user}</b> last checked, unusual price movement, and unusual volume. All prices in INR.</p>
+  </header>
+    <section className="toolbar">
+      <form onSubmit={(e) => { e.preventDefault(); void logout(); }}><label>Signed in as<input value={user} readOnly aria-label="Active user" /><button>Switch</button></label></form>
+      <form onSubmit={addTicker}><label>Add ticker<input value={symbol} onChange={(e) => setSymbol(e.target.value)} placeholder="e.g. RELIANCE" maxLength={12} aria-label="Stock symbol" /></label><button disabled={busy}>Add</button></form>
+      <div className="actions"><button onClick={() => void action(() => api.markSeen(user))} disabled={busy || !items.length}>Mark all seen</button><button onClick={() => void action(api.tick)} disabled={busy}>Refresh prices</button></div>
+    </section>
+    <section className="ledger" aria-live="polite"><div className="ledger-head"><span>{items.length} watched</span><span>{updated ? `updated ${updated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "connecting…"}</span></div>{loading ? <div className="state">Opening your ledger…</div> : error ? <div className="state error"><strong>Market service unavailable.</strong><span>{error}</span><button onClick={() => void refresh()}>Try again</button></div> : !items.length ? <div className="state"><strong>Your watchlist is empty.</strong><span>Add a ticker to start noticing change, not just prices.</span></div> : <div className="rows">{sorted.map(({ item, index }) => { const key = item.symbol ?? item.ticker ?? String(index); return <Row key={key} item={item} expanded={expanded === key} onToggle={() => setExpanded(expanded === key ? null : key)} onDelete={() => void action(() => api.removeSymbol(user!, key))} />; })}</div>}</section>
+    <footer><span className="dot" /> {stats ? `${stats.unique_symbols} unique symbols tracked across ${stats.users} users — ingestion is deduplicated per symbol, not per viewer. ` : ""}Refreshes every 10 seconds · flag = a personal move &gt;5%, price anomaly &gt;2σ, or volume &gt;2×</footer>
   </main>;
 }

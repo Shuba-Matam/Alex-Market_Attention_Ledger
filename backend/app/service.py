@@ -47,6 +47,30 @@ def normalize_symbol(symbol: str) -> str:
     return value
 
 
+DEMO_USERS = ("demo", "aarav", "priya", "rohan")
+
+
+def seed_users() -> None:
+    """Dummy accounts for the login screen: plain rows, no credentials by design."""
+    now = int(time.time())
+    with connection() as conn:
+        for username in DEMO_USERS:
+            conn.execute("INSERT OR IGNORE INTO users(username, created_at) VALUES (?, ?)", (username, now))
+
+
+def list_users() -> list[str]:
+    with connection() as conn:
+        return [row["username"] for row in conn.execute("SELECT username FROM users ORDER BY created_at, username")]
+
+
+def stats() -> dict:
+    """Scaling proof: ingestion is deduplicated per symbol, not per user-per-symbol."""
+    with connection() as conn:
+        symbols = conn.execute("SELECT COUNT(DISTINCT symbol) AS n FROM watchlist_items").fetchone()["n"]
+        users = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+    return {"unique_symbols": symbols, "users": users}
+
+
 def add_symbol(username: str, symbol: str) -> str:
     symbol = normalize_symbol(symbol)
     if not username.strip():
@@ -64,7 +88,7 @@ def initialize_seen_price(username: str, symbol: str) -> None:
     now = int(time.time())
     with connection() as conn:
         price = conn.execute(
-            "SELECT price_inr FROM price_snapshots WHERE symbol=? ORDER BY provider_timestamp DESC, id DESC LIMIT 1",
+            "SELECT price_inr FROM price_snapshots WHERE symbol=? ORDER BY fetched_at DESC, id DESC LIMIT 1",
             (symbol,),
         ).fetchone()
         if price and price["price_inr"] is not None:
@@ -115,6 +139,10 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
             # Sources agree (or only one reported): prefer the primary source.
             winner = next((q for q in candidates if q.source == yahoo.source), candidates[0])
         winner_inr = converted[winner.source]
+        # Keep the losing value too, so the UI can show exactly what disagreed.
+        loser = next((q for q in candidates if q is not winner), None)
+        loser_source = loser.source if conflict and loser else ""
+        loser_inr = converted[loser.source] if loser_source else None
         previous_close = winner.previous_close
         previous_close_inr = convert_to_inr(previous_close, winner.currency, usd_to_inr) if previous_close is not None else None
         sources = ",".join(sorted(q.source for q in candidates))
@@ -122,14 +150,16 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
             conn.execute("INSERT OR IGNORE INTO symbols(symbol, created_at) VALUES (?, ?)", (item, now))
             conn.execute("""INSERT INTO price_snapshots(symbol, price, native_currency, price_inr, usd_to_inr,
                          previous_close, previous_close_inr, volume, provider_timestamp, fetched_at, source,
-                         source_winner, candidate_sources, conflict_detected, single_sourced)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         source_winner, candidate_sources, conflict_detected, single_sourced,
+                         conflict_other_source, conflict_other_price_inr)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                          (item, winner.price, winner.currency, winner_inr, usd_to_inr,
                           previous_close, previous_close_inr, winner.volume, winner.timestamp, now, winner.source,
-                          winner.source if conflict else "", sources, int(conflict), int(len(candidates) == 1)))
+                          winner.source if conflict else "", sources, int(conflict), int(len(candidates) == 1),
+                          loser_source, loser_inr))
             conn.execute("""DELETE FROM price_snapshots WHERE id IN (
                             SELECT id FROM price_snapshots WHERE symbol=?
-                            ORDER BY provider_timestamp DESC, id DESC LIMIT -1 OFFSET ?)
+                            ORDER BY id DESC LIMIT -1 OFFSET ?)
                          """, (item, MAX_SNAPSHOTS_PER_SYMBOL))
         result.append({"symbol": item, "updated": True, "price_inr": winner_inr, "native_price": winner.price,
                        "native_currency": winner.currency, "source_winner": winner.source,
@@ -173,11 +203,17 @@ def watchlist(username: str) -> list[dict]:
                              WHERE w.username=? ORDER BY w.symbol""", (username,)).fetchall()
         result = []
         for item in items:
-            snapshots = conn.execute("SELECT * FROM price_snapshots WHERE symbol=? ORDER BY provider_timestamp DESC, id DESC LIMIT 30", (item["symbol"],)).fetchall()
+            # Latest *fetch* wins, not the provider's event time: provider timestamps
+            # are only comparable within one poll cycle (sources disagree on clocks,
+            # and a listing change can move them backwards). Storage cap is by
+            # insertion order for the same reason — see the retention delete in tick().
+            snapshots = conn.execute("SELECT * FROM price_snapshots WHERE symbol=? ORDER BY fetched_at DESC, id DESC LIMIT 30", (item["symbol"],)).fetchall()
             if not snapshots:
                 result.append({"symbol": item["symbol"], "price": None, "volume": None, "source": None,
                                "provider_timestamp": None, "candidate_sources": [], "conflict_detected": False,
-                               "single_sourced": True, "recent_prices": [], "personal_delta_pct": None,
+                               "single_sourced": True, "conflict_other_source": None,
+                               "conflict_other_price_inr": None,
+                               "recent_prices": [], "personal_delta_pct": None,
                                "anomaly_zscore": None, "volume_spike_ratio": None, "flagged": False,
                                "data_age_seconds": None, "is_stale": True})
                 continue
@@ -202,6 +238,8 @@ def watchlist(username: str) -> list[dict]:
                            "candidate_sources": latest["candidate_sources"].split(","),
                            "conflict_detected": bool(latest["conflict_detected"]),
                            "single_sourced": bool(latest["single_sourced"]),
+                           "conflict_other_source": latest["conflict_other_source"] or None,
+                           "conflict_other_price_inr": latest["conflict_other_price_inr"],
                            "recent_prices": list(reversed([r["price_inr"] for r in snapshots])),
                            "previous_session_close": previous_close,
                            "previous_session_close_display": format_inr(previous_close),
@@ -214,7 +252,7 @@ def mark_seen(username: str) -> int:
     now = int(time.time())
     with connection() as conn:
         rows = conn.execute("""SELECT w.symbol, (SELECT price_inr FROM price_snapshots p WHERE p.symbol=w.symbol
-                            ORDER BY provider_timestamp DESC, id DESC LIMIT 1) AS price FROM watchlist_items w WHERE w.username=?""", (username,)).fetchall()
+                            ORDER BY fetched_at DESC, id DESC LIMIT 1) AS price FROM watchlist_items w WHERE w.username=?""", (username,)).fetchall()
         for row in rows:
             if row["price"] is not None:
                 conn.execute("""INSERT INTO user_symbol_state(username,symbol,last_seen_price,last_seen_at) VALUES(?,?,?,?)

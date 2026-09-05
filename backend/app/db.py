@@ -52,7 +52,9 @@ def init_db() -> None:
               source_winner TEXT NOT NULL DEFAULT '',
               candidate_sources TEXT NOT NULL DEFAULT '',
               conflict_detected INTEGER NOT NULL DEFAULT 0,
-              single_sourced INTEGER NOT NULL DEFAULT 0
+              single_sourced INTEGER NOT NULL DEFAULT 0,
+              conflict_other_source TEXT NOT NULL DEFAULT '',
+              conflict_other_price_inr REAL
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_time
               ON price_snapshots(symbol, provider_timestamp DESC, id DESC);
@@ -65,3 +67,13 @@ def init_db() -> None:
             );
             """
         )
+        migrate_conflict_columns(conn)
+
+
+def migrate_conflict_columns(conn: sqlite3.Connection) -> None:
+    """Idempotent: older DBs predate the conflict-visibility columns."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(price_snapshots)")}
+    if "conflict_other_source" not in existing:
+        conn.execute("ALTER TABLE price_snapshots ADD COLUMN conflict_other_source TEXT NOT NULL DEFAULT ''")
+    if "conflict_other_price_inr" not in existing:
+        conn.execute("ALTER TABLE price_snapshots ADD COLUMN conflict_other_price_inr REAL")

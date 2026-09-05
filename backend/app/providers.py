@@ -90,9 +90,11 @@ class FxRateProvider:
 class YahooChartProvider:
     """Primary live source: Yahoo Finance chart endpoint. Keyless.
 
-    US tickers resolve as-is (AAPL); NSE tickers are not resolvable without an
-    exchange suffix, so a failed plain lookup is retried once with .NS and the
-    resolution is cached for subsequent polls.
+    Some tickers exist on both NSE and US exchanges (INFY trades as Infosys Ltd
+    on NSE and as the Infosys ADR on NYSE). This is an India-first product, so
+    the NSE listing (.NS) is tried first for suffix-less symbols and the US
+    listing is the fallback. The resolution is cached, so steady-state polling
+    costs one request per symbol either way.
     """
 
     source = "yahoo"
@@ -100,13 +102,18 @@ class YahooChartProvider:
     _SUFFIX_CACHE: dict[str, str] = {}
 
     def quote(self, symbol: str) -> Optional[Quote]:
-        market_symbol = self._market_symbol(symbol)
-        result = self._fetch(market_symbol)
-        if result is None and "." not in symbol:
-            market_symbol = f"{symbol.upper()}.NS"
-            result = self._fetch(market_symbol)
-            if result is not None:
-                YahooChartProvider._SUFFIX_CACHE[symbol.upper()] = market_symbol
+        upper = symbol.upper()
+        if "." in upper:
+            result = self._fetch(upper)
+        else:
+            cached = YahooChartProvider._SUFFIX_CACHE.get(upper)
+            if cached:
+                result = self._fetch(cached)
+                if result is None:  # cached resolution went stale; re-resolve once
+                    YahooChartProvider._SUFFIX_CACHE.pop(upper, None)
+                    result = self._resolve(upper)
+            else:
+                result = self._resolve(upper)
         if result is None:
             return None
         try:
@@ -132,8 +139,15 @@ class YahooChartProvider:
         except (KeyError, ValueError, TypeError, IndexError):
             return None
 
-    def _market_symbol(self, symbol: str) -> str:
-        return YahooChartProvider._SUFFIX_CACHE.get(symbol.upper(), symbol.upper())
+    @staticmethod
+    def _resolve(upper: str) -> Optional[dict]:
+        """Resolve a suffix-less symbol: NSE listing first, US fallback."""
+        for candidate in (f"{upper}.NS", upper):
+            result = YahooChartProvider._fetch(candidate)
+            if result is not None:
+                YahooChartProvider._SUFFIX_CACHE[upper] = candidate
+                return result
+        return None
 
     @staticmethod
     def _fetch(market_symbol: str) -> Optional[dict]:

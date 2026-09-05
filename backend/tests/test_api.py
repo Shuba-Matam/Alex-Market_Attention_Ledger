@@ -41,6 +41,9 @@ def test_watchlist_signals_with_live_sources(monkeypatch):
 
         _mock_fx(monkeypatch)
         clock = iter(range(1, 1000))
+        # Backfilled intraday bars give the new symbol real history from minute one.
+        bars = [(1000 + i * 900, 1400.0 + i * 5, 1_000_000.0) for i in range(8)]
+        monkeypatch.setattr(providers.YahooChartProvider, "history", lambda self, symbol, **kwargs: list(bars))
         monkeypatch.setattr(providers.YahooChartProvider, "quote",
                             lambda self, symbol: _quote(1420.0, next(clock), previous_close=1400.0))
         monkeypatch.setattr(providers.TwelveDataProvider, "quote", lambda self, symbol: None)
@@ -56,6 +59,10 @@ def test_watchlist_signals_with_live_sources(monkeypatch):
             assert data["single_sourced"] is True
             assert data["conflict_detected"] is False
             assert data["previous_session_close"] == 1400.0
+            # 8 backfilled bars + live quote(s) — seeded users also watch RELIANCE,
+            # so the startup poller may have added one more live row.
+            assert len(data["recent_prices"]) >= 9
+            assert data["anomaly_zscore"] is not None
             assert client.post("/watchlist/alice/seen").json()["marked"] == 1
             monkeypatch.setattr(providers.YahooChartProvider, "quote",
                                 lambda self, symbol: _quote(1420.0 * 1.10, next(clock)))
@@ -355,6 +362,35 @@ def test_tickers_with_ampersand_are_valid(monkeypatch):
             response = client.post("/watchlist/alice/symbols", json={"symbol": "M&M"})
             assert response.status_code == 201
             assert response.json()["symbol"] == "M&M"
+
+
+def test_backfill_and_change_only_persistence(monkeypatch):
+    """A new symbol gets real intraday history on its first poll; unchanged
+    quotes are not re-stored, so statistics keep real variance."""
+    with _fresh_db(monkeypatch):
+        from app.main import app
+        from app import providers
+        from app.db import connection
+
+        _mock_fx(monkeypatch)
+        bars = [(1000 + i * 900, 1400.0 + i * 10, 500_000.0) for i in range(6)]
+        monkeypatch.setattr(providers.YahooChartProvider, "history", lambda self, symbol, **kwargs: list(bars))
+        ts = int(time.time())
+        monkeypatch.setattr(providers.YahooChartProvider, "quote",
+                            lambda self, symbol: _quote(1420.0, ts, previous_close=1450.0))
+        with TestClient(app) as client:
+            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+            client.post("/poll", json={"symbol": "RELIANCE"})
+            client.post("/poll", json={"symbol": "RELIANCE"})
+            with connection() as conn:
+                n = conn.execute(
+                    "SELECT COUNT(*) AS n FROM price_snapshots WHERE symbol='RELIANCE'").fetchone()["n"]
+            # 6 backfilled bars + the single live quote; identical repeats are not stored.
+            assert n == 7
+            data = client.get("/watchlist/alice").json()["items"][0]
+            assert len(data["recent_prices"]) == 7
+            assert data["previous_session_close"] == 1450.0
+            assert data["anomaly_zscore"] is not None  # real history has variance
 
 
 def test_format_inr_uses_indian_grouping():

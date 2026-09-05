@@ -6,7 +6,7 @@
 # demo must survive redeploys.
 services:
   - type: web
-    name: watchme-api
+    name: alex-watchlist-api
     runtime: python
     plan: free
     rootDir: backend

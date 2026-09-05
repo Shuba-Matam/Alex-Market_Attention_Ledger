@@ -90,7 +90,7 @@ function Row({ item, expanded, onToggle, onDelete }: { item: Item; expanded: boo
 
 function LoginScreen({ users, onPick }: { users: string[]; onPick: (user: string) => void }) {
   return <main className="login">
-    <header><p className="eyebrow">Market attention ledger</p><h1>Who is<br /><em>checking in?</em></h1>
+    <header><p className="eyebrow">Alex Watchlist · market attention ledger</p><h1>Who is<br /><em>checking in?</em></h1>
       <p className="lede">Pick an account to open its ledger. State persists per user — what you marked seen stays seen.</p></header>
     <section className="user-picker" aria-label="Accounts">
       {users.length
@@ -172,7 +172,7 @@ export default function App() {
   if (welcome) return <WelcomeScreen user={user} items={items} loading={loading} onEnter={() => setWelcome(false)} />;
 
   return <main><header>
-    <p className="eyebrow">Market attention ledger</p>
+    <p className="eyebrow">Alex Watchlist · market attention ledger</p>
     <h1>What changed<br /><em>while you were away?</em></h1>
     <p className="lede">Signals are personal: change since <b>{user}</b> last checked, unusual price movement, and unusual volume. All prices in INR.</p>
   </header>
@@ -182,6 +182,6 @@ export default function App() {
       <div className="actions"><button onClick={() => void action(() => api.markSeen(user))} disabled={busy || !items.length}>Mark all seen</button><button onClick={() => void action(api.tick)} disabled={busy}>Refresh prices</button></div>
     </section>
     <section className="ledger" aria-live="polite"><div className="ledger-head"><span>{items.length} watched</span>{digest && <span className="digest">{digest}</span>}<span>{updated ? `updated ${updated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "connecting…"}</span></div>{loading ? <div className="state">Opening your ledger…</div> : error ? <div className="state error"><strong>Market service unavailable.</strong><span>{error}</span><button onClick={() => void refresh()}>Try again</button></div> : !items.length ? <div className="state"><strong>Your watchlist is empty.</strong><span>Add a ticker to start noticing change, not just prices.</span></div> : <div className="rows">{sorted.map(({ item, index }) => { const key = item.symbol ?? item.ticker ?? String(index); return <Row key={key} item={item} expanded={expanded === key} onToggle={() => setExpanded(expanded === key ? null : key)} onDelete={() => void action(() => api.removeSymbol(user!, key))} />; })}</div>}</section>
-    <footer>{anySimulated && <span className="sim-note">Market asleep: rows marked SIMULATED are generated from the last real close so the change signals keep running — not live prices. </span>}<span className="dot" /> {stats ? `${stats.unique_symbols} unique symbols tracked across ${stats.users} users — ingestion is deduplicated per symbol, not per viewer. ` : ""}Refreshes every 10 seconds · flag = a personal move &gt;5%, price anomaly &gt;2σ, or volume &gt;2×</footer>
+    <footer>{anySimulated && <span className="sim-note">Market asleep: rows marked SIMULATED are generated from the last real close so the change signals keep running — not live prices. </span>}<span className="dot" /> {stats ? `${stats.unique_symbols} unique symbols tracked across ${stats.users} users — ingestion is deduplicated per symbol, not per viewer. ` : ""}Refreshes every 10 seconds · flag = a personal move &gt;5%, price anomaly &gt;2σ, or volume &gt;2× · Alex Watchlist</footer>
   </main>;
 }

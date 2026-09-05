@@ -32,7 +32,8 @@ def init_db() -> None:
             );
             CREATE TABLE IF NOT EXISTS symbols (
               symbol TEXT PRIMARY KEY,
-              created_at INTEGER NOT NULL
+              created_at INTEGER NOT NULL,
+              last_polled_at INTEGER
             );
             CREATE TABLE IF NOT EXISTS watchlist_items (
               username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
@@ -72,6 +73,7 @@ def init_db() -> None:
             """
         )
         migrate_conflict_columns(conn)
+        migrate_add_last_polled(conn)
 
 
 def migrate_conflict_columns(conn: sqlite3.Connection) -> None:
@@ -81,3 +83,11 @@ def migrate_conflict_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE price_snapshots ADD COLUMN conflict_other_source TEXT NOT NULL DEFAULT ''")
     if "conflict_other_price_inr" not in existing:
         conn.execute("ALTER TABLE price_snapshots ADD COLUMN conflict_other_price_inr REAL")
+
+
+def migrate_add_last_polled(conn: sqlite3.Connection) -> None:
+    """Idempotent: per-symbol ingestion freshness, kept even when a poll finds
+    nothing new (so 'is this feed alive' is not confused with 'nothing moved')."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(symbols)")}
+    if "last_polled_at" not in existing:
+        conn.execute("ALTER TABLE symbols ADD COLUMN last_polled_at INTEGER")

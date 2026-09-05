@@ -16,3 +16,5 @@ def no_network(monkeypatch):
                                                    timestamp=int(time.time()), source="yahoo",
                                                    currency="INR", previous_close=1400.0))
     monkeypatch.setattr(providers.FxRateProvider, "get_usd_to_inr", lambda self, force=False: 90.0)
+    # The startup poller now backfills history for seeded symbols; keep tests off the wire.
+    monkeypatch.setattr(providers.YahooChartProvider, "history", lambda self, symbol, **kwargs: [])

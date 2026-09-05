@@ -1,4 +1,4 @@
-# Signal Watchlist
+# Alex Watchlist
 
 An attention-first market watchlist built for Groww Code 2026. It answers **what changed while I was away?** rather than presenting an undifferentiated price list.
 

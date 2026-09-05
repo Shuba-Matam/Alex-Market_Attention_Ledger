@@ -149,6 +149,36 @@ class YahooChartProvider:
                 return result
         return None
 
+    def history(self, symbol: str, interval: str = "15m", rng: str = "1d") -> list[tuple[int, float, Optional[float]]]:
+        """Intraday bars (provider_timestamp, price, volume) in native currency.
+
+        Used to backfill a newly added symbol so signals and the chart have real
+        history immediately instead of starting from an empty table. Called after
+        a successful live quote so the .NS suffix resolution is already cached.
+        """
+        upper = symbol.upper()
+        market_symbol = YahooChartProvider._SUFFIX_CACHE.get(upper, upper)
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
+               f"{urllib.parse.quote(market_symbol)}?interval={interval}&range={rng}")
+        try:
+            body = _http_get_json(url)
+            result = body["chart"]["result"][0]
+        except (HttpError, KeyError, IndexError, TypeError):
+            return []
+        timestamps = result.get("timestamp") or []
+        indicators = (result.get("indicators") or {}).get("quote") or []
+        closes = indicators[0].get("close") or [] if indicators else []
+        volumes = indicators[0].get("volume") or [] if indicators else []
+        bars = []
+        for ts, close, volume in zip(timestamps, closes, volumes):
+            try:
+                if close is None or int(ts) <= 0 or float(close) <= 0:
+                    continue
+                bars.append((int(ts), float(close), float(volume) if volume is not None else None))
+            except (TypeError, ValueError):
+                continue
+        return bars
+
     @staticmethod
     def _fetch(market_symbol: str) -> Optional[dict]:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(market_symbol)}"

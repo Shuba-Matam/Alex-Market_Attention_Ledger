@@ -61,7 +61,7 @@ DEMO_USERS = ("demo", "aarav", "priya", "rohan")
 # Seeded once, only when the user has no items — never overrides user edits.
 SEED_WATCHLISTS = {
     "demo": ("INFY", "RELIANCE", "TCS"),
-    "aarav": ("TCS", "HDFCBANK", "TATAMOTORS", "AAPL"),
+    "aarav": ("TCS", "HDFCBANK", "TATASTEEL", "AAPL"),
     "priya": ("INFY", "SBIN", "ITC", "MSFT"),
     "rohan": ("RELIANCE", "BHARTIARTL", "AAPL", "NVDA"),
 }
@@ -145,6 +145,19 @@ def _simulate_quote(symbol: str, last: Optional[object]) -> Quote:
                  source="simulated", currency="INR", previous_close=previous_close)
 
 
+def _backfill_history(conn, symbol: str, currency: str, usd_to_inr: Optional[float], now: int) -> None:
+    """Backfill real intraday bars for a brand-new symbol so the chart and the
+    statistical signals have history from minute one instead of an empty table."""
+    for ts, price, volume in YahooChartProvider().history(symbol):
+        conn.execute("""INSERT INTO price_snapshots(symbol, price, native_currency, price_inr, usd_to_inr,
+                     previous_close, previous_close_inr, volume, provider_timestamp, fetched_at, source,
+                     source_winner, candidate_sources, conflict_detected, single_sourced,
+                     conflict_other_source, conflict_other_price_inr)
+                     VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, 'yahoo', '', 'yahoo', 0, 0, '', NULL)""",
+                     (symbol, price, currency, convert_to_inr(price, currency, usd_to_inr), usd_to_inr,
+                      volume, ts, now))
+
+
 def tick(symbol: Optional[str] = None) -> list[dict]:
     """Poll live sources once for each watchlisted symbol and persist the resolved INR quote.
 
@@ -200,20 +213,34 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
         simulated = winner.source == "simulated"
         with connection() as conn:
             conn.execute("INSERT OR IGNORE INTO symbols(symbol, created_at) VALUES (?, ?)", (item, now))
-            conn.execute("""INSERT INTO price_snapshots(symbol, price, native_currency, price_inr, usd_to_inr,
-                         previous_close, previous_close_inr, volume, provider_timestamp, fetched_at, source,
-                         source_winner, candidate_sources, conflict_detected, single_sourced,
-                         conflict_other_source, conflict_other_price_inr)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                         (item, winner.price, winner.currency, winner_inr, usd_to_inr,
-                          previous_close, previous_close_inr, winner.volume, winner.timestamp, now, winner.source,
-                          winner.source if conflict else "", sources, int(conflict), int(len(candidates) == 1 and not simulated),
-                          loser_source, loser_inr))
+            conn.execute("UPDATE symbols SET last_polled_at=? WHERE symbol=?", (now, item))
+            latest = conn.execute(
+                "SELECT price, provider_timestamp, source FROM price_snapshots WHERE symbol=? ORDER BY fetched_at DESC, id DESC LIMIT 1",
+                (item,)).fetchone()
+            if latest is None:
+                _backfill_history(conn, item, winner.currency, usd_to_inr, now)
+            # Persist only when the market event changed: 15-second polls of an
+            # unchanged quote would flood history with identical rows and flatten
+            # every statistic to zero variance. Feed freshness lives in
+            # symbols.last_polled_at, not in duplicated rows.
+            unchanged = (latest is not None and latest["price"] == winner.price
+                         and latest["provider_timestamp"] == winner.timestamp
+                         and latest["source"] == winner.source)
+            if not unchanged:
+                conn.execute("""INSERT INTO price_snapshots(symbol, price, native_currency, price_inr, usd_to_inr,
+                             previous_close, previous_close_inr, volume, provider_timestamp, fetched_at, source,
+                             source_winner, candidate_sources, conflict_detected, single_sourced,
+                             conflict_other_source, conflict_other_price_inr)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                             (item, winner.price, winner.currency, winner_inr, usd_to_inr,
+                              previous_close, previous_close_inr, winner.volume, winner.timestamp, now, winner.source,
+                              winner.source if conflict else "", sources, int(conflict), int(len(candidates) == 1 and not simulated),
+                              loser_source, loser_inr))
             conn.execute("""DELETE FROM price_snapshots WHERE id IN (
                             SELECT id FROM price_snapshots WHERE symbol=?
                             ORDER BY id DESC LIMIT -1 OFFSET ?)
                          """, (item, MAX_SNAPSHOTS_PER_SYMBOL))
-        result.append({"symbol": item, "updated": True, "price_inr": winner_inr, "native_price": winner.price,
+        result.append({"symbol": item, "updated": True, "changed": not unchanged, "price_inr": winner_inr, "native_price": winner.price,
                        "native_currency": winner.currency, "source_winner": winner.source,
                        "candidate_sources": sources, "conflict_detected": conflict,
                        "single_sourced": len(candidates) == 1 and not simulated,
@@ -248,16 +275,23 @@ def _signal(row, snapshots: list) -> dict:
     flagged = ((personal is not None and abs(personal) > PERSONAL_DELTA_THRESHOLD) or
                (zscore is not None and abs(zscore) > ANOMALY_ZSCORE_THRESHOLD) or
                (volume_ratio is not None and volume_ratio > VOLUME_SPIKE_THRESHOLD))
-    # Freshness belongs to the latest market snapshot, not the per-user seen state.
-    age = max(0, int(time.time()) - latest_row["fetched_at"])
+    # Feed freshness is "did ingestion reach this symbol recently" (last_polled_at),
+    # not "did the price move recently" — a stable market is not a broken feed.
+    polled_at = row["last_polled_at"]
+    if polled_at:
+        age = max(0, int(time.time()) - polled_at)
+    else:
+        age = max(0, int(time.time()) - latest_row["fetched_at"])
     return {"personal_delta_pct": personal, "anomaly_zscore": zscore, "volume_spike_ratio": volume_ratio,
             "flagged": flagged, "data_age_seconds": age, "is_stale": age > STALE_AFTER_SECONDS}
 
 
 def watchlist(username: str) -> list[dict]:
     with connection() as conn:
-        items = conn.execute("""SELECT w.symbol, state.last_seen_price, state.last_seen_at FROM watchlist_items w
+        items = conn.execute("""SELECT w.symbol, s.last_polled_at, state.last_seen_price, state.last_seen_at
+                             FROM watchlist_items w
                              LEFT JOIN user_symbol_state state ON state.username=w.username AND state.symbol=w.symbol
+                             LEFT JOIN symbols s ON s.symbol=w.symbol
                              WHERE w.username=? ORDER BY w.symbol""", (username,)).fetchall()
         result = []
         for item in items:

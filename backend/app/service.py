@@ -22,6 +22,9 @@ PERSONAL_DELTA_THRESHOLD = 5.0
 ANOMALY_ZSCORE_THRESHOLD = 2.0
 VOLUME_SPIKE_THRESHOLD = 2.0
 MAX_SNAPSHOTS_PER_SYMBOL = 100
+# Simulated rows get a small window of their own: a weekend of walk ticks must
+# never evict real market history from the retention cap.
+MAX_SIMULATED_PER_SYMBOL = 20
 STALE_AFTER_SECONDS = 45
 MIN_HISTORY = 5
 SIMULATION_ENABLED = os.getenv("SIMULATE_WHEN_MARKET_CLOSED", "1") != "0"
@@ -132,12 +135,16 @@ def remove_symbol(username: str, symbol: str) -> bool:
 
 
 def _simulate_quote(symbol: str, last: Optional[object]) -> Quote:
-    """A clearly-labelled random walk from the last real INR price, used only while
-    that symbol's market is closed. Generated rows carry source='simulated' so the
-    UI can disclaim them; they are never blended with live sources."""
+    """A clearly-labelled random walk around the last real INR close, used only
+    while that symbol's market is closed. The walk mean-reverts toward the real
+    close so a long weekend cannot drift prices into fantasy territory.
+    Generated rows carry source='simulated' so the UI can disclaim them; they
+    are never blended with live sources."""
     last_inr = last["price_inr"] if last and last["price_inr"] else None
     base = last_inr if last_inr and last_inr > 0 else 100.0
-    price = max(0.05, round(base * (1 + random.gauss(0, 0.004)), 2))
+    anchor = (last["previous_close_inr"] if last and last["previous_close_inr"] else None) or base
+    step = random.gauss(0, 0.004) + 0.05 * (anchor - base) / base
+    price = max(0.05, round(base * (1 + step), 2))
     base_volume = last["volume"] if last and last["volume"] else random.randint(500_000, 5_000_000)
     volume = int(base_volume * random.uniform(0.75, 1.35))
     previous_close = last["previous_close_inr"] if last else None
@@ -187,12 +194,20 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
 
         # Market asleep (night/weekend/holiday): replace live candidates with a
         # clearly-labelled simulated walk so the change signals keep running.
-        # Every generated row keeps source='simulated' end to end.
+        # Every generated row keeps source='simulated' end to end. On a symbol's
+        # very first poll the real history is backfilled first, so the walk
+        # anchors to the real close instead of a fallback constant.
         if SIMULATION_ENABLED and all(market_is_asleep(q) for q in candidates):
+            currency = candidates[0].currency
             with connection() as conn:
                 last = conn.execute(
                     "SELECT price_inr, volume, previous_close_inr FROM price_snapshots WHERE symbol=? ORDER BY fetched_at DESC, id DESC LIMIT 1",
                     (item,)).fetchone()
+                if last is None:
+                    _backfill_history(conn, item, currency, usd_to_inr, now)
+                    last = conn.execute(
+                        "SELECT price_inr, volume, previous_close_inr FROM price_snapshots WHERE symbol=? ORDER BY fetched_at DESC, id DESC LIMIT 1",
+                        (item,)).fetchone()
             candidates = [_simulate_quote(item, last)]
 
         converted = {quote.source: convert_to_inr(quote.price, quote.currency, usd_to_inr) for quote in candidates}
@@ -237,9 +252,13 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
                               winner.source if conflict else "", sources, int(conflict), int(len(candidates) == 1 and not simulated),
                               loser_source, loser_inr))
             conn.execute("""DELETE FROM price_snapshots WHERE id IN (
-                            SELECT id FROM price_snapshots WHERE symbol=?
+                            SELECT id FROM price_snapshots WHERE symbol=? AND source!='simulated'
                             ORDER BY id DESC LIMIT -1 OFFSET ?)
                          """, (item, MAX_SNAPSHOTS_PER_SYMBOL))
+            conn.execute("""DELETE FROM price_snapshots WHERE id IN (
+                            SELECT id FROM price_snapshots WHERE symbol=? AND source='simulated'
+                            ORDER BY id DESC LIMIT -1 OFFSET ?)
+                         """, (item, MAX_SIMULATED_PER_SYMBOL))
         result.append({"symbol": item, "updated": True, "changed": not unchanged, "price_inr": winner_inr, "native_price": winner.price,
                        "native_currency": winner.currency, "source_winner": winner.source,
                        "candidate_sources": sources, "conflict_detected": conflict,

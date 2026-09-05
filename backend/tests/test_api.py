@@ -393,6 +393,60 @@ def test_backfill_and_change_only_persistence(monkeypatch):
             assert data["anomaly_zscore"] is not None  # real history has variance
 
 
+def test_simulated_rows_cannot_evict_real_history(monkeypatch):
+    """A weekend of simulated ticks (one per poll) must never push real market
+    history out of the retention window — real rows survive until reopen."""
+    with _fresh_db(monkeypatch):
+        from app.main import app
+        from app import providers, service
+        from app.db import connection
+
+        _mock_fx(monkeypatch)
+        monkeypatch.setattr(service, "SIMULATION_ENABLED", True)
+        bars = [(1000 + i * 900, 1400.0 + i * 10, 500_000.0) for i in range(6)]
+        monkeypatch.setattr(providers.YahooChartProvider, "history", lambda self, symbol, **kwargs: list(bars))
+        asleep = _quote(1420.0, int(time.time()) - 7_200)
+        monkeypatch.setattr(providers.YahooChartProvider, "quote", lambda self, symbol: asleep)
+        with TestClient(app) as client:
+            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+            for _ in range(40):
+                client.post("/poll", json={"symbol": "RELIANCE"})
+            with connection() as conn:
+                real = conn.execute(
+                    "SELECT COUNT(*) AS n FROM price_snapshots WHERE symbol='RELIANCE' AND source!='simulated'").fetchone()["n"]
+                sim = conn.execute(
+                    "SELECT COUNT(*) AS n FROM price_snapshots WHERE symbol='RELIANCE' AND source='simulated'").fetchone()["n"]
+            assert real == 6   # every backfilled real bar survives
+            assert sim == service.MAX_SIMULATED_PER_SYMBOL
+
+
+def test_simulated_walk_anchors_to_real_history(monkeypatch):
+    """On a fresh database whose market is already closed, the walk must anchor
+    to the backfilled real close — not a fallback constant — and must stay near
+    it (mean reversion) however long the closure lasts."""
+    with _fresh_db(monkeypatch):
+        from app.main import app
+        from app import providers, service
+
+        _mock_fx(monkeypatch)
+        monkeypatch.setattr(service, "SIMULATION_ENABLED", True)
+        bars = [(1000 + i * 900, 1420.0, 500_000.0) for i in range(6)]
+        monkeypatch.setattr(providers.YahooChartProvider, "history", lambda self, symbol, **kwargs: list(bars))
+        asleep = _quote(1420.0, int(time.time()) - 7_200)
+        monkeypatch.setattr(providers.YahooChartProvider, "quote", lambda self, symbol: asleep)
+        with TestClient(app) as client:
+            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+            data = client.get("/watchlist/alice").json()["items"][0]
+            assert data["simulated"] is True
+            # Anchored to the real ~₹1,420 close, not the ₹100 fallback.
+            assert 1_000 < data["price"] < 1_800
+            for _ in range(30):
+                client.post("/poll", json={"symbol": "RELIANCE"})
+            data = client.get("/watchlist/alice").json()["items"][0]
+            # Mean reversion keeps a 30-tick walk within a believable band.
+            assert 1_200 < data["price"] < 1_680
+
+
 def test_format_inr_uses_indian_grouping():
     from app.service import format_inr
 

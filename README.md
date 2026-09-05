@@ -30,28 +30,35 @@ An attention-first market watchlist built for Groww Code 2026. It answers **what
 - **Honest freshness.** Feed staleness ("we haven't reached this symbol in 45s") is separate from market closure, and the UI shows data age, source, and resolved conflicts on every row.
 - **A footer stat** ("N unique symbols tracked across M users") is the demoable proof that ingestion is deduplicated per symbol, not per user-per-symbol — the actual scaling lever.
 
-## Run it locally
+## Run it
+
+**Hosted (no setup):** open [alex-market-attention-ledger.vercel.app](https://alex-market-attention-ledger.vercel.app), pick any account on the login screen, and you're in. The first load after inactivity may take ~30 seconds (free-tier server waking up). If markets are closed, rows are honestly labelled `SIMULATED` — prices, personal deltas, and charts still work; during market hours you'll see live prices. The API and its docs live at [alex-watchlist-api.onrender.com/docs](https://alex-watchlist-api.onrender.com/docs).
+
+**Locally:**
 
 ```powershell
+# backend (Python 3.11+)
 cd backend
+python -m venv .venv
+.\.venv\Scripts\pip install -r requirements.txt
 .\.venv\Scripts\python -m uvicorn app.main:app --reload
 ```
 
 ```powershell
+# frontend (Node 18+)
 cd frontend
+npm install
 npm run dev
 ```
 
 Visit `http://localhost:5173`, pick an account, and add tickers — NSE names (`RELIANCE`, `TCS`, `M&M`), US names (`AAPL`), and spaced input (`hdfc bank` → `HDFCBANK`) all work.
 
-Optional secondary source:
+Optional secondary source (US symbols get dual-source conflict checking; Twelve Data's free plan does not cover NSE):
 
 ```powershell
 $env:TWELVE_DATA_API_KEY="your-key"
 .\.venv\Scripts\python -m uvicorn app.main:app --reload
 ```
-
-Without the key every row is honestly labelled single-sourced; with it, US symbols get true dual-source conflict checking (Twelve Data's free plan does not cover NSE symbols).
 
 ## Deploy
 

@@ -1,17 +1,21 @@
-"""Market-data adapters. All adapters return normalized Quote candidates."""
+"""Market-data adapters. Two live sources only — no synthetic data.
+
+Yahoo Finance's keyless chart endpoint is the primary source; Twelve Data
+(when an API key is set) is the secondary cross-check. Prices are stored in
+their native currency and converted to INR at the API boundary using a cached
+FX rate, so NSE quotes are never double-converted.
+"""
 from __future__ import annotations
 
-import hashlib
 import json
-import math
 import os
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Optional
-
-import yfinance as yf
 
 
 @dataclass(frozen=True)
@@ -21,93 +25,259 @@ class Quote:
     volume: Optional[float]
     timestamp: int
     source: str
+    currency: str
+    previous_close: Optional[float] = None
 
 
-class SyntheticProvider:
-    """Repeatable, no-network feed. State is derived from persisted history length."""
-    source = "synthetic"
+class HttpError(RuntimeError):
+    """Network/HTTP failure while contacting a provider."""
 
-    def quote(self, symbol: str, sequence: int, scenario: str = "normal") -> Quote:
-        key = int(hashlib.sha256(symbol.encode()).hexdigest()[:8], 16)
-        base = 50 + (key % 45_000) / 100
-        wave = math.sin(sequence * 0.71 + (key % 17)) * base * 0.006
-        drift = sequence * base * 0.00025
-        price = base + wave + drift
-        volume = 90_000 + (key % 250_000) + abs(math.sin(sequence * 0.43)) * 45_000
-        if scenario == "price_jump":
-            price *= 1.085
-        elif scenario == "volume_spike":
-            volume *= 3.5
-        elif scenario != "normal":
-            raise ValueError("scenario must be normal, price_jump, or volume_spike")
-        return Quote(symbol=symbol, price=round(price, 2), volume=round(volume), timestamp=int(time.time()), source=self.source)
+
+_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+_FX_TICKER = "INR=X"
+_FX_DEFAULT_REFRESH_SECONDS = 300
+_FX_RATE = None  # type: ignore[assignment]
+_FX_RATE_FETCHED_AT = 0.0
+_FX_LOCK = threading.Lock()
+
+
+def _http_get_json(url: str, headers: Optional[dict] = None, timeout: int = 8) -> dict:
+    merged = {"User-Agent": _USER_AGENT, "Accept": "application/json"}
+    if headers:
+        merged.update(headers)
+    req = urllib.request.Request(url, headers=merged)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+        raise HttpError(str(exc)) from exc
+
+
+class FxRateProvider:
+    """Cached USD->INR rate fetched from Yahoo's chart endpoint (ticker INR=X).
+
+    FX does not need 15-second freshness, so the rate is refetched only after
+    FX_REFRESH_SECONDS (default 300) and the last good value is reused when
+    Yahoo is unreachable.
+    """
+
+    def __init__(self, refresh_seconds: Optional[int] = None):
+        self.refresh_seconds = (
+            refresh_seconds
+            if refresh_seconds is not None
+            else int(os.getenv("FX_REFRESH_SECONDS", str(_FX_DEFAULT_REFRESH_SECONDS)))
+        )
+
+    def get_usd_to_inr(self, force: bool = False) -> Optional[float]:
+        global _FX_RATE, _FX_RATE_FETCHED_AT
+        now = time.time()
+        with _FX_LOCK:
+            if not force and _FX_RATE and (now - _FX_RATE_FETCHED_AT) < self.refresh_seconds:
+                return _FX_RATE
+            try:
+                body = _http_get_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{_FX_TICKER}")
+                result = body["chart"]["result"][0]
+                rate = float(result["meta"]["regularMarketPrice"])
+                if rate <= 0:
+                    return _FX_RATE
+                _FX_RATE = rate
+                _FX_RATE_FETCHED_AT = now
+                return rate
+            except (HttpError, KeyError, ValueError, TypeError, IndexError):
+                return _FX_RATE
+
+
+class YahooChartProvider:
+    """Primary live source: Yahoo Finance chart endpoint. Keyless.
+
+    US tickers resolve as-is (AAPL); NSE tickers are not resolvable without an
+    exchange suffix, so a failed plain lookup is retried once with .NS and the
+    resolution is cached for subsequent polls.
+    """
+
+    source = "yahoo"
+
+    _SUFFIX_CACHE: dict[str, str] = {}
+
+    def quote(self, symbol: str) -> Optional[Quote]:
+        market_symbol = self._market_symbol(symbol)
+        result = self._fetch(market_symbol)
+        if result is None and "." not in symbol:
+            market_symbol = f"{symbol.upper()}.NS"
+            result = self._fetch(market_symbol)
+            if result is not None:
+                YahooChartProvider._SUFFIX_CACHE[symbol.upper()] = market_symbol
+        if result is None:
+            return None
+        try:
+            meta = result["meta"]
+            price = float(meta["regularMarketPrice"])
+            if price <= 0:
+                return None
+            previous_close = meta.get("chartPreviousClose")
+            if previous_close is not None:
+                previous_close = float(previous_close)
+            timestamp = int(meta["regularMarketTime"])
+            currency = str(meta.get("currency") or "").upper()
+            volume = self._latest_volume(result)
+            return Quote(
+                symbol=symbol,
+                price=price,
+                volume=volume,
+                timestamp=timestamp,
+                source=self.source,
+                currency=currency,
+                previous_close=previous_close,
+            )
+        except (KeyError, ValueError, TypeError, IndexError):
+            return None
+
+    def _market_symbol(self, symbol: str) -> str:
+        return YahooChartProvider._SUFFIX_CACHE.get(symbol.upper(), symbol.upper())
+
+    @staticmethod
+    def _fetch(market_symbol: str) -> Optional[dict]:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(market_symbol)}"
+        try:
+            body = _http_get_json(url)
+            return body["chart"]["result"][0]
+        except (HttpError, KeyError, IndexError, TypeError):
+            return None
+
+    @staticmethod
+    def _latest_volume(result: dict) -> Optional[float]:
+        indicators = result.get("indicators") or {}
+        quotes = indicators.get("quote") or []
+        if not quotes:
+            return None
+        volumes = quotes[0].get("volume") or []
+        for value in reversed(volumes):
+            if value is not None:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return None
+        return None
 
 
 class TwelveDataProvider:
-    """Optional OHLCV adapter. A network failure is represented by None, never fake freshness."""
+    """Secondary live source via /quote. Optional; degrades gracefully without a key.
+
+    The free tier allows ~800 requests/day, so calls are throttled to at most
+    one per TWELVE_DATA_MIN_INTERVAL_SECONDS (default 110s ≈ 785/day). When the
+    throttle blocks a call the symbol is simply single-sourced (Yahoo) for that
+    poll cycle.
+
+    Verified against the documented /quote response: it includes `currency`,
+    `exchange`, `previous_close`, `timestamp`, `close` and `volume`. Currency
+    inference from the exchange is only a fallback for older responses.
+    """
+
     source = "twelve_data"
 
-    def __init__(self, api_key: Optional[str] = None):
+    _CALL_LOCK = threading.Lock()
+    _LAST_CALL = 0.0
+
+    def __init__(self, api_key: Optional[str] = None, min_interval: Optional[float] = None):
         self.api_key = api_key or os.getenv("TWELVE_DATA_API_KEY")
+        self.min_interval = (
+            min_interval
+            if min_interval is not None
+            else float(os.getenv("TWELVE_DATA_MIN_INTERVAL_SECONDS", "110"))
+        )
 
     @property
     def enabled(self) -> bool:
         return bool(self.api_key)
 
+    def _throttle(self) -> bool:
+        """True when this call is allowed under the free-tier budget."""
+        if self.min_interval <= 0:
+            return True
+        with TwelveDataProvider._CALL_LOCK:
+            now = time.monotonic()
+            if now - TwelveDataProvider._LAST_CALL >= self.min_interval:
+                TwelveDataProvider._LAST_CALL = now
+                return True
+            return False
+
     def quote(self, symbol: str) -> Optional[Quote]:
-        if not self.enabled:
+        if not self.enabled or not self._throttle():
             return None
-        query = urllib.parse.urlencode({
-            "symbol": symbol, "interval": "1min", "outputsize": 1, "apikey": self.api_key,
-        })
-        request = urllib.request.Request(f"https://api.twelvedata.com/time_series?{query}")
+        params = urllib.parse.urlencode({"symbol": symbol, "apikey": self.api_key})
+        url = f"https://api.twelvedata.com/quote?{params}"
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
-                body = json.loads(response.read().decode("utf-8"))
-            values = body.get("values") or []
-            if not values:
+            body = _http_get_json(url)
+        except HttpError:
+            return None
+        if not isinstance(body, dict) or body.get("status") == "error":
+            return None
+        try:
+            price = float(body["close"])
+            if price <= 0:
                 return None
-            candle = values[0]
-            # Twelve timestamps are exchange-local strings. We record fetch time to avoid pretending
-            # a parsed local timestamp has a known timezone.
-            return Quote(symbol, float(candle["close"]), float(candle["volume"]) if candle.get("volume") else None,
-                         int(time.time()), self.source)
-        except (OSError, ValueError, KeyError, urllib.error.URLError):
-            return None
-
-
-class YFinanceProvider:
-    """Optional NSE OHLCV adapter. It never lets a provider error break ingestion."""
-
-    source = "yfinance"
-
-    def quote(self, symbol: str) -> Optional[Quote]:
-        # Watchlists keep clean symbols (for example RELIANCE); only the provider
-        # receives yfinance's NSE suffix.
-        market_symbol = symbol if symbol.upper().endswith(".NS") else f"{symbol}.NS"
-        try:
-            history = yf.Ticker(market_symbol).history(
-                period="5d", interval="1m", auto_adjust=False, raise_errors=False
+            previous_close = body.get("previous_close")
+            if previous_close not in (None, ""):
+                previous_close = float(previous_close)
+            else:
+                previous_close = None
+            timestamp_raw = body.get("timestamp") or body.get("datetime")
+            timestamp = int(float(timestamp_raw)) if timestamp_raw is not None else int(time.time())
+            volume_raw = body.get("volume")
+            volume = float(volume_raw) if volume_raw not in (None, "") else None
+            currency = self._resolve_currency(body)
+            return Quote(
+                symbol=symbol,
+                price=price,
+                volume=volume,
+                timestamp=timestamp,
+                source=self.source,
+                currency=currency,
+                previous_close=previous_close,
             )
-            if history.empty:
-                return None
-            latest = history.iloc[-1]
-            close = float(latest["Close"])
-            if not math.isfinite(close) or close <= 0:
-                return None
-            volume_value = latest.get("Volume")
-            volume = float(volume_value) if volume_value is not None else None
-            if volume is not None and not math.isfinite(volume):
-                volume = None
-            timestamp = int(history.index[-1].timestamp())
-            return Quote(symbol, close, volume, timestamp, self.source)
-        except Exception:
-            # yfinance can raise for network, symbol, pandas parsing, and upstream
-            # response errors. The service will retain prior data and mark it stale.
+        except (KeyError, ValueError, TypeError):
             return None
+
+    @staticmethod
+    def _resolve_currency(payload: dict) -> str:
+        explicit = payload.get("currency")
+        if explicit:
+            return str(explicit).upper()
+        exchange = (payload.get("exchange") or "").upper()
+        if exchange in {"NSE", "BSE", "BSE_INDEX", "NSE_INDEX"}:
+            return "INR"
+        country = (payload.get("country") or "").upper()
+        if country in {"INDIA", "IN"}:
+            return "INR"
+        return "USD"
 
 
 def choose_freshest(candidates: list[Quote]) -> Quote:
-    """Newest provider timestamp wins; live provider wins a timestamp tie deterministically."""
-    priority = {"yfinance": 3, "twelve_data": 2, "synthetic": 1}
+    """Resolve a conflicting multi-source poll: fresher provider timestamp wins,
+    with a deterministic priority tie-break."""
+    priority = {"yahoo": 3, "twelve_data": 2}
     return max(candidates, key=lambda item: (item.timestamp, priority.get(item.source, 0)))
+
+
+def convert_to_inr(price: float, currency: str, usd_to_inr: Optional[float]) -> float:
+    """Convert `price` to INR. INR prices are returned unchanged (never double-converted)."""
+    code = (currency or "").upper()
+    if code in {"INR", ""}:
+        return price
+    if code == "USD" and usd_to_inr:
+        return price * usd_to_inr
+    # Unknown currencies are returned as-is so the UI can show provenance.
+    return price
+
+
+def conflict_threshold_pct() -> float:
+    """Threshold above which two converted quotes are flagged as a real conflict."""
+    return float(os.getenv("CONFLICT_THRESHOLD_PCT", "0.5"))
+
+
+def is_conflict(inr_a: float, inr_b: float) -> bool:
+    """True when two INR-converted prices for the same symbol differ beyond the threshold."""
+    denominator = max(abs(inr_a), abs(inr_b))
+    if denominator == 0:
+        return False
+    return abs(inr_a - inr_b) / denominator * 100 > conflict_threshold_pct()

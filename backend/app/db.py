@@ -40,12 +40,19 @@ def init_db() -> None:
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               symbol TEXT NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
               price REAL NOT NULL,
+              native_currency TEXT NOT NULL DEFAULT 'INR',
+              price_inr REAL NOT NULL,
+              usd_to_inr REAL,
+              previous_close REAL,
+              previous_close_inr REAL,
               volume REAL,
               provider_timestamp INTEGER NOT NULL,
               fetched_at INTEGER NOT NULL,
               source TEXT NOT NULL,
+              source_winner TEXT NOT NULL DEFAULT '',
+              candidate_sources TEXT NOT NULL DEFAULT '',
               conflict_detected INTEGER NOT NULL DEFAULT 0,
-              candidate_sources TEXT NOT NULL DEFAULT ''
+              single_sourced INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_time
               ON price_snapshots(symbol, provider_timestamp DESC, id DESC);

@@ -7,20 +7,20 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .db import init_db
-from .service import add_symbol, initialize_seen_price, mark_seen, remove_symbol, seed_demo_watchlist, tick, watchlist
+from .db import connection, init_db
+from .providers import YahooChartProvider
+from .service import add_symbol, initialize_seen_price, mark_seen, remove_symbol, tick, watchlist
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    seed_demo_watchlist()
     interval = max(1, int(os.getenv("POLL_INTERVAL_SECONDS", "15")))
     stop = asyncio.Event()
 
     async def poller() -> None:
         while not stop.is_set():
-            # tick is deliberately synchronous because the optional provider uses urllib.
+            # tick is deliberately synchronous because the providers use urllib.
             # It runs off-loop so requests remain responsive while data is fetched.
             try:
                 await asyncio.to_thread(tick)
@@ -42,6 +42,18 @@ async def lifespan(app: FastAPI):
             await worker
 
 
+def _has_any_data(symbol: str) -> bool:
+    """True when a live source returns a quote, or any snapshot already exists for the symbol.
+    This prevents persisting typos like NVDIA when no source can price them."""
+    if YahooChartProvider().quote(symbol) is not None:
+        return True
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM price_snapshots WHERE symbol=? LIMIT 1", (symbol,)
+        ).fetchone()
+        return row is not None
+
+
 app = FastAPI(title="Signal Watchlist API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -51,9 +63,8 @@ class SymbolBody(BaseModel):
     symbol: str = Field(min_length=1, max_length=15)
 
 
-class TickBody(BaseModel):
+class PollBody(BaseModel):
     symbol: Optional[str] = None
-    scenario: str = "normal"
 
 
 @app.get("/health")
@@ -70,13 +81,20 @@ def get_watchlist(username: str):
 def post_symbol(username: str, body: SymbolBody):
     try:
         symbol = add_symbol(username, body.symbol)
-        # A newly added symbol should be meaningful immediately, rather than waiting
-        # up to one polling interval for the background worker.
-        tick(symbol)
-        initialize_seen_price(username, symbol)
-        return {"symbol": symbol}
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    # Reject unknown tickers only when no live or historical data can be obtained.
+    if not _has_any_data(symbol):
+        remove_symbol(username, symbol)
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{symbol}' is not a recognised ticker on Yahoo Finance or Twelve Data",
+        )
+    # A newly added symbol should be meaningful immediately, rather than waiting
+    # up to one polling interval for the background worker.
+    tick(symbol)
+    initialize_seen_price(username, symbol)
+    return {"symbol": symbol}
 
 
 @app.delete("/watchlist/{username}/symbols/{symbol}")
@@ -94,9 +112,11 @@ def post_seen(username: str):
     return {"marked": mark_seen(username)}
 
 
-@app.post("/demo/tick")
-def post_tick(body: TickBody):
+@app.post("/poll")
+def post_poll(body: PollBody):
+    """Trigger an immediate poll (all watchlisted symbols, or one) instead of waiting
+    for the background worker's next cycle."""
     try:
-        return {"updates": tick(body.symbol, body.scenario)}
+        return {"updates": tick(body.symbol)}
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error

@@ -18,5 +18,5 @@ export const api = {
   addSymbol: (username: string, symbol: string) => request<unknown>(`/watchlist/${encodeURIComponent(username)}/symbols`, { method: "POST", body: JSON.stringify({ symbol }) }),
   removeSymbol: (username: string, symbol: string) => request<unknown>(`/watchlist/${encodeURIComponent(username)}/symbols/${encodeURIComponent(symbol)}`, { method: "DELETE" }),
   markSeen: (username: string) => request<unknown>(`/watchlist/${encodeURIComponent(username)}/seen`, { method: "POST" }),
-  tick: () => request<unknown>("/demo/tick", { method: "POST", body: JSON.stringify({}) }),
+  tick: () => request<unknown>("/poll", { method: "POST", body: JSON.stringify({}) }),
 };

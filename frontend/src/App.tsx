@@ -101,8 +101,29 @@ function LoginScreen({ users, onPick }: { users: string[]; onPick: (user: string
   </main>;
 }
 
+function WelcomeScreen({ user, items, loading, onEnter }: { user: string; items: Item[]; loading: boolean; onEnter: () => void }) {
+  const changed = items.filter((i) => Math.abs(numeric(i.personal_delta_pct) ?? 0) > 0.01);
+  const flagged = items.filter((i) => i.flagged).length;
+  const movers = [...changed].sort((a, b) => Math.abs(numeric(b.personal_delta_pct)!) - Math.abs(numeric(a.personal_delta_pct)!)).slice(0, 4);
+  const anySimulated = items.some((i) => i.simulated);
+  return <main className="login">
+    <header><p className="eyebrow">Welcome back, {user}</p><h1>While you<br /><em>were away…</em></h1>
+      <p className="lede">{loading ? "Checking your ledger…"
+        : items.length ? `${flagged ? `${flagged} of ${items.length} watched symbols need attention. ` : "Nothing is flagged. "}${changed.length ? `${changed.length} moved since your last visit.` : "No price moved since your last visit."}`
+        : "Your ledger is empty — add a ticker to start noticing change."}</p></header>
+    {loading ? null : <section className="user-picker" aria-label="Changes since your last visit">
+      {movers.length
+        ? movers.map((item) => <button key={item.symbol ?? item.ticker} onClick={onEnter}><strong>{item.symbol ?? item.ticker}</strong><small>{pct(item.personal_delta_pct)} since you looked · open row →</small></button>)
+        : items.length ? <p className="lede">Your ledger is exactly as you left it.</p> : null}
+    </section>}
+    {anySimulated && <p className="lede sim-note">Some markets are asleep — rows marked SIMULATED are generated from the last real close, not live prices.</p>}
+    <footer><button onClick={onEnter} disabled={loading}>Open the full ledger →</button></footer>
+  </main>;
+}
+
 export default function App() {
   const [user, setUser] = useState<string | null>(() => localStorage.getItem("watch-ledger-user"));
+  const [welcome, setWelcome] = useState(false);
   const [accounts, setAccounts] = useState<string[]>([]);
   const [symbol, setSymbol] = useState("");
   const [items, setItems] = useState<Item[]>([]), [expanded, setExpanded] = useState<string | null>(null), [loading, setLoading] = useState(true), [error, setError] = useState("");
@@ -142,12 +163,13 @@ export default function App() {
     return `${flagged ? `${flagged} of ${items.length} need attention · ` : ""}biggest move since you left: ${biggest.symbol ?? biggest.ticker} ${move > 0 ? "+" : ""}${move.toFixed(2)}%`;
   }, [items]);
   const anySimulated = items.some((i) => i.simulated);
-  const login = (next: string) => { localStorage.setItem("watch-ledger-user", next); setExpanded(null); setItems([]); setUser(next); };
-  const logout = () => { localStorage.removeItem("watch-ledger-user"); setUser(null); setItems([]); setExpanded(null); };
+  const login = (next: string) => { localStorage.setItem("watch-ledger-user", next); setExpanded(null); setItems([]); setUser(next); setWelcome(true); };
+  const logout = () => { localStorage.removeItem("watch-ledger-user"); setUser(null); setWelcome(false); setItems([]); setExpanded(null); };
   const action = async (fn: () => Promise<unknown>) => { setBusy(true); try { await fn(); await refresh(true); } catch (e) { setError(e instanceof Error ? e.message : "Action failed."); } finally { setBusy(false); } };
   const addTicker = (e: FormEvent) => { e.preventDefault(); const next = symbol.trim().toUpperCase(); if (next) void action(() => api.addSymbol(user!, next)); setSymbol(""); };
 
   if (!user) return <LoginScreen users={accounts} onPick={login} />;
+  if (welcome) return <WelcomeScreen user={user} items={items} loading={loading} onEnter={() => setWelcome(false)} />;
 
   return <main><header>
     <p className="eyebrow">Market attention ledger</p>

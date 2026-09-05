@@ -154,15 +154,90 @@ def test_seeded_users_and_stats(monkeypatch):
                 assert again.get("/users").json()["users"] == users
             assert client.get("/stats").json()["users"] == len(users)
 
-            from app import providers
+            from app import providers, service
             _mock_fx(monkeypatch)
             monkeypatch.setattr(providers.YahooChartProvider, "quote",
                                 lambda self, symbol: _quote(1420.0, 1000))
             client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
             client.post("/watchlist/bob/symbols", json={"symbol": "RELIANCE"})
             stats = client.get("/stats").json()
-            # One symbol watched by two users counts once — dedup proof.
-            assert stats["unique_symbols"] == 1
+            # One symbol watched by two users counts once — dedup proof. Seeded
+            # starter watchlists are deduplicated the same way.
+            expected = len({s for symbols in service.SEED_WATCHLISTS.values() for s in symbols} | {"RELIANCE"})
+            assert stats["unique_symbols"] == expected
+
+
+def test_every_seeded_user_opens_with_a_watchlist(monkeypatch):
+    with _fresh_db(monkeypatch):
+        from app.main import app
+        from app.service import SEED_WATCHLISTS
+
+        with TestClient(app) as client:
+            for username, symbols in SEED_WATCHLISTS.items():
+                items = client.get(f"/watchlist/{username}").json()["items"]
+                assert {i["symbol"] for i in items} == set(symbols)
+
+
+def test_simulated_data_never_contaminates_real_signals(monkeypatch):
+    """Simulated rows must never become the baseline a real move is measured
+    against, nor the history a real anomaly is scored against."""
+    with _fresh_db(monkeypatch):
+        from app.main import app
+        from app import providers, service
+        from app.db import connection
+
+        _mock_fx(monkeypatch)
+        monkeypatch.setattr(service, "SIMULATION_ENABLED", True)
+        real_awake = _quote(1420.0, int(time.time()), previous_close=1400.0)
+        monkeypatch.setattr(providers.YahooChartProvider, "quote", lambda self, symbol: real_awake)
+        with TestClient(app) as client:
+            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+            for _ in range(6):
+                client.post("/poll", json={"symbol": "RELIANCE"})
+            assert client.post("/watchlist/alice/seen").json()["marked"] == 1
+
+            # Market goes to sleep: simulated rows accumulate, user "sees" them.
+            asleep = _quote(1420.0, int(time.time()) - 7_200)
+            monkeypatch.setattr(providers.YahooChartProvider, "quote", lambda self, symbol: asleep)
+            for _ in range(3):
+                client.post("/poll", json={"symbol": "RELIANCE"})
+            client.post("/watchlist/alice/seen")
+
+            with connection() as conn:
+                baseline = conn.execute(
+                    "SELECT last_seen_price FROM user_symbol_state WHERE username='alice'").fetchone()["last_seen_price"]
+            assert baseline == 1420.0  # the real close, not a simulated walk value
+
+            # Market reopens with a real +10% move.
+            monkeypatch.setattr(providers.YahooChartProvider, "quote",
+                                lambda self, symbol: _quote(1420.0 * 1.10, int(time.time())))
+            client.post("/poll", json={"symbol": "RELIANCE"})
+            data = client.get("/watchlist/alice").json()["items"][0]
+            assert data["personal_delta_pct"] == 10.0
+            # Prior real history is flat at 1420 -> zero deviation -> no anomaly score.
+            # Contaminating it with simulated rows would manufacture a large fake z.
+            assert data["anomaly_zscore"] is None
+            assert data["flagged"] is True  # the real +10% personal move is the flag
+
+
+def test_tickers_with_spaces_are_normalized(monkeypatch):
+    """Users type 'hdfc bank'; the NSE ticker is HDFCBANK."""
+    from app.service import normalize_symbol
+
+    assert normalize_symbol("hdfc bank") == "HDFCBANK"
+    assert normalize_symbol("bajaj auto") == "BAJAJAUTO"
+
+    with _fresh_db(monkeypatch):
+        from app.main import app
+        from app import providers
+
+        _mock_fx(monkeypatch)
+        monkeypatch.setattr(providers.YahooChartProvider, "quote",
+                            lambda self, symbol: _quote(1420.0, int(time.time())))
+        with TestClient(app) as client:
+            response = client.post("/watchlist/alice/symbols", json={"symbol": "hdfc bank"})
+            assert response.status_code == 201
+            assert response.json()["symbol"] == "HDFCBANK"
 
 
 def test_yahoo_prefers_nse_for_dual_listed_tickers(monkeypatch):
@@ -186,15 +261,15 @@ def test_yahoo_prefers_nse_for_dual_listed_tickers(monkeypatch):
     monkeypatch.setattr(providers.YahooChartProvider, "_SUFFIX_CACHE", {})
 
     provider = providers.YahooChartProvider()
-    nse = provider.quote("INFY")
-    assert nse.currency == "INR" and nse.price == 1500.0
+    nse_result = provider._resolve("INFY")
+    assert nse_result["meta"]["currency"] == "INR" and nse_result["meta"]["regularMarketPrice"] == 1500.0
 
-    usd = provider.quote("AAPL")
-    assert usd.currency == "USD" and usd.price == 319.97
+    us_result = provider._resolve("AAPL")
+    assert us_result["meta"]["currency"] == "USD"
 
-    # Resolution is cached: a repeat poll does not re-probe both suffixes.
+    # Resolution is cached: a repeat resolve does not re-probe both suffixes.
     fetched.clear()
-    provider.quote("INFY")
+    provider._resolve("INFY")
     assert fetched == ["INFY.NS"]
 
 

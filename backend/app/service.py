@@ -44,7 +44,9 @@ def format_inr(amount: Optional[float]) -> Optional[str]:
 
 
 def normalize_symbol(symbol: str) -> str:
-    value = symbol.strip().upper()
+    # Users type company names with spaces ("hdfc bank"); NSE tickers are the
+    # concatenated form (HDFCBANK), so whitespace is removed before validating.
+    value = "".join(symbol.split()).upper()
     if value.endswith(".NS"):
         value = value[:-3]
     # '&' appears in real NSE tickers (M&M, L&TFH) — reject only clearly invalid input.
@@ -55,13 +57,29 @@ def normalize_symbol(symbol: str) -> str:
 
 DEMO_USERS = ("demo", "aarav", "priya", "rohan")
 
+# Starter watchlists so every seeded account opens with something to look at.
+# Seeded once, only when the user has no items — never overrides user edits.
+SEED_WATCHLISTS = {
+    "demo": ("INFY", "RELIANCE", "TCS"),
+    "aarav": ("TCS", "HDFCBANK", "TATAMOTORS", "AAPL"),
+    "priya": ("INFY", "SBIN", "ITC", "MSFT"),
+    "rohan": ("RELIANCE", "BHARTIARTL", "AAPL", "NVDA"),
+}
+
 
 def seed_users() -> None:
-    """Dummy accounts for the login screen: plain rows, no credentials by design."""
+    """Dummy accounts (no credentials by design) plus a starter watchlist each."""
     now = int(time.time())
     with connection() as conn:
-        for username in DEMO_USERS:
+        for username, symbols in SEED_WATCHLISTS.items():
             conn.execute("INSERT OR IGNORE INTO users(username, created_at) VALUES (?, ?)", (username, now))
+            has_items = conn.execute("SELECT 1 FROM watchlist_items WHERE username=? LIMIT 1", (username,)).fetchone()
+            if has_items:
+                continue
+            for symbol in symbols:
+                conn.execute("INSERT OR IGNORE INTO symbols(symbol, created_at) VALUES (?, ?)", (symbol, now))
+                conn.execute("INSERT OR IGNORE INTO watchlist_items(username, symbol, created_at) VALUES (?, ?, ?)",
+                             (username, symbol, now))
 
 
 def list_users() -> list[str]:
@@ -90,11 +108,14 @@ def add_symbol(username: str, symbol: str) -> str:
 
 
 def initialize_seen_price(username: str, symbol: str) -> None:
-    """Set a first baseline (in INR) only when this user has never seen this symbol."""
+    """Set a first baseline (in INR) only when this user has never seen this symbol.
+    Baselines come from real quotes only — a simulated price must never become
+    the reference a future real move is measured against."""
     now = int(time.time())
     with connection() as conn:
         price = conn.execute(
-            "SELECT price_inr FROM price_snapshots WHERE symbol=? ORDER BY fetched_at DESC, id DESC LIMIT 1",
+            """SELECT price_inr FROM price_snapshots WHERE symbol=? AND source!='simulated'
+               ORDER BY fetched_at DESC, id DESC LIMIT 1""",
             (symbol,),
         ).fetchone()
         if price and price["price_inr"] is not None:
@@ -201,29 +222,34 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
 
 
 def _signal(row, snapshots: list) -> dict:
-    prices = [r["price_inr"] for r in snapshots]
-    volumes = [r["volume"] for r in snapshots]
-    latest = prices[0]
-    prior_prices = prices[1:]
-    prior_volumes = [v for v in volumes[1:] if v is not None]
+    latest_row = snapshots[0]
+    latest = latest_row["price_inr"]
+    simulated_latest = latest_row["source"] == "simulated"
+    # Statistical signals are computed on real quotes only: simulated rows may be
+    # displayed (and are always labelled), but they never become the history a
+    # real anomaly is measured against, and a simulated value is never scored.
+    real = [r for r in snapshots if r["source"] != "simulated"]
+    prior_prices = [r["price_inr"] for r in real[1:]]
+    prior_volumes = [r["volume"] for r in real[1:] if r["volume"] is not None]
     personal = None
     if row["last_seen_price"] not in (None, 0):
         personal = round((latest - row["last_seen_price"]) / row["last_seen_price"] * 100, 2)
     zscore = None
-    if len(prior_prices) >= MIN_HISTORY:
-        deviation = statistics.pstdev(prior_prices)
-        if deviation > 0:
-            zscore = round((latest - statistics.mean(prior_prices)) / deviation, 2)
     volume_ratio = None
-    if volumes[0] is not None and len(prior_volumes) >= MIN_HISTORY:
-        mean_volume = statistics.mean(prior_volumes)
-        if mean_volume > 0:
-            volume_ratio = round(volumes[0] / mean_volume, 2)
+    if real and not simulated_latest:
+        if len(prior_prices) >= MIN_HISTORY:
+            deviation = statistics.pstdev(prior_prices)
+            if deviation > 0:
+                zscore = round((real[0]["price_inr"] - statistics.mean(prior_prices)) / deviation, 2)
+        if real[0]["volume"] is not None and len(prior_volumes) >= MIN_HISTORY:
+            mean_volume = statistics.mean(prior_volumes)
+            if mean_volume > 0:
+                volume_ratio = round(real[0]["volume"] / mean_volume, 2)
     flagged = ((personal is not None and abs(personal) > PERSONAL_DELTA_THRESHOLD) or
                (zscore is not None and abs(zscore) > ANOMALY_ZSCORE_THRESHOLD) or
                (volume_ratio is not None and volume_ratio > VOLUME_SPIKE_THRESHOLD))
     # Freshness belongs to the latest market snapshot, not the per-user seen state.
-    age = max(0, int(time.time()) - snapshots[0]["fetched_at"])
+    age = max(0, int(time.time()) - latest_row["fetched_at"])
     return {"personal_delta_pct": personal, "anomaly_zscore": zscore, "volume_spike_ratio": volume_ratio,
             "flagged": flagged, "data_age_seconds": age, "is_stale": age > STALE_AFTER_SECONDS}
 
@@ -285,6 +311,7 @@ def mark_seen(username: str) -> int:
     now = int(time.time())
     with connection() as conn:
         rows = conn.execute("""SELECT w.symbol, (SELECT price_inr FROM price_snapshots p WHERE p.symbol=w.symbol
+                            AND p.source!='simulated'
                             ORDER BY fetched_at DESC, id DESC LIMIT 1) AS price FROM watchlist_items w WHERE w.username=?""", (username,)).fetchall()
         for row in rows:
             if row["price"] is not None:

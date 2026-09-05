@@ -134,6 +134,15 @@ def remove_symbol(username: str, symbol: str) -> bool:
         return conn.execute("DELETE FROM watchlist_items WHERE username=? AND symbol=?", (username, normalize_symbol(symbol))).rowcount > 0
 
 
+def _baseline_all_watchers(conn, symbol: str, price: float, now: int) -> None:
+    """Give every user watching `symbol` a personal baseline (only fills users
+    without one), so seeded starter watchlists show personal deltas without
+    requiring a manual 'mark seen' click first."""
+    conn.execute("""INSERT OR IGNORE INTO user_symbol_state(username, symbol, last_seen_price, last_seen_at)
+                 SELECT w.username, w.symbol, ?, ? FROM watchlist_items w WHERE w.symbol=?""",
+                 (price, now, symbol))
+
+
 def _simulate_quote(symbol: str, last: Optional[object], last_real: Optional[object]) -> Quote:
     """A clearly-labelled random walk around the last real INR close, used only
     while that symbol's market is closed. The walk mean-reverts toward the real
@@ -214,6 +223,10 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
                     last_real = conn.execute(
                         "SELECT price_inr, volume, previous_close_inr FROM price_snapshots WHERE symbol=? AND source!='simulated' ORDER BY fetched_at DESC, id DESC LIMIT 1",
                         (item,)).fetchone()
+                    # First data arrived during closure: baseline every watcher
+                    # from the real close, never from a simulated price.
+                    if last_real and last_real["price_inr"]:
+                        _baseline_all_watchers(conn, item, last_real["price_inr"], now)
             candidates = [_simulate_quote(item, last, last_real)]
 
         converted = {quote.source: convert_to_inr(quote.price, quote.currency, usd_to_inr) for quote in candidates}
@@ -240,6 +253,11 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
                 (item,)).fetchone()
             if latest is None:
                 _backfill_history(conn, item, winner.currency, usd_to_inr, now)
+                first_real = conn.execute(
+                    "SELECT price_inr FROM price_snapshots WHERE symbol=? AND source!='simulated' ORDER BY fetched_at DESC, id DESC LIMIT 1",
+                    (item,)).fetchone()
+                if first_real:
+                    _baseline_all_watchers(conn, item, first_real["price_inr"], now)
             # Persist only when the market event changed: 15-second polls of an
             # unchanged quote would flood history with identical rows and flatten
             # every statistic to zero variance. Feed freshness lives in
@@ -257,6 +275,10 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
                               previous_close, previous_close_inr, winner.volume, winner.timestamp, now, winner.source,
                               winner.source if conflict else "", sources, int(conflict), int(len(candidates) == 1 and not simulated),
                               loser_source, loser_inr))
+                if not simulated:
+                    # A real quote is also the personal baseline for any watcher
+                    # who has never seen this symbol.
+                    _baseline_all_watchers(conn, item, winner_inr, now)
             conn.execute("""DELETE FROM price_snapshots WHERE id IN (
                             SELECT id FROM price_snapshots WHERE symbol=? AND source!='simulated'
                             ORDER BY id DESC LIMIT -1 OFFSET ?)

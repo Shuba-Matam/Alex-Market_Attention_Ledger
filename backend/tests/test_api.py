@@ -447,6 +447,41 @@ def test_simulated_walk_anchors_to_real_history(monkeypatch):
             assert 1_200 < data["price"] < 1_680
 
 
+def test_seeded_watchlists_get_baselines_from_first_real_poll(monkeypatch):
+    """Starter watchlists are seeded without baselines; the first real quote a
+    watcher's symbol receives becomes their baseline, so 'since you looked'
+    works without a manual mark-seen click. Simulated ticks must not baseline."""
+    with _fresh_db(monkeypatch):
+        from app.main import app
+        from app import providers, service
+        from app.db import connection
+
+        _mock_fx(monkeypatch)
+        monkeypatch.setattr(service, "SIMULATION_ENABLED", True)
+        bars = [(1000 + i * 900, 1420.0, 500_000.0) for i in range(6)]
+        monkeypatch.setattr(providers.YahooChartProvider, "history", lambda self, symbol, **kwargs: list(bars))
+        monkeypatch.setattr(providers.YahooChartProvider, "quote",
+                            lambda self, symbol: _quote(1420.0, int(time.time()) - 7_200))  # asleep
+        with TestClient(app) as client:
+            client.post("/poll", json={"symbol": "INFY"})  # sim rows only, symbol's first data
+            data = client.get("/watchlist/priya").json()["items"][0]
+            assert data["simulated"] is True
+            # Symbol's first data arrived during closure: watchers are baselined
+            # from the backfilled REAL close, never from a simulated price.
+            with connection() as conn:
+                baseline = conn.execute(
+                    "SELECT last_seen_price FROM user_symbol_state WHERE username='priya' AND symbol='INFY'").fetchone()["last_seen_price"]
+            assert baseline == 1420.0
+            sim_delta = data["personal_delta_pct"]
+            assert sim_delta is not None and abs(sim_delta) < 5  # small walk deviation, real anchor
+            # Market reopens with real data.
+            monkeypatch.setattr(providers.YahooChartProvider, "quote",
+                                lambda self, symbol: _quote(1420.0, int(time.time())))
+            client.post("/poll", json={"symbol": "INFY"})
+            data = client.get("/watchlist/priya").json()["items"][0]
+            assert data["personal_delta_pct"] == 0.0  # baselined from the real close
+
+
 def test_format_inr_uses_indian_grouping():
     from app.service import format_inr
 

@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .db import init_db
-from .service import add_symbol, mark_seen, remove_symbol, seed_demo_watchlist, tick, watchlist
+from .service import add_symbol, initialize_seen_price, mark_seen, remove_symbol, seed_demo_watchlist, tick, watchlist
 
 
 @asynccontextmanager
@@ -73,6 +73,7 @@ def post_symbol(username: str, body: SymbolBody):
         # A newly added symbol should be meaningful immediately, rather than waiting
         # up to one polling interval for the background worker.
         tick(symbol)
+        initialize_seen_price(username, symbol)
         return {"symbol": symbol}
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error

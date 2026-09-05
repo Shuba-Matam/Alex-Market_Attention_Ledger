@@ -11,6 +11,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 
+import yfinance as yf
+
 
 @dataclass(frozen=True)
 class Quote:
@@ -74,7 +76,38 @@ class TwelveDataProvider:
             return None
 
 
+class YFinanceProvider:
+    """Optional NSE OHLCV adapter. It never lets a provider error break ingestion."""
+
+    source = "yfinance"
+
+    def quote(self, symbol: str) -> Optional[Quote]:
+        # Watchlists keep clean symbols (for example RELIANCE); only the provider
+        # receives yfinance's NSE suffix.
+        market_symbol = symbol if symbol.upper().endswith(".NS") else f"{symbol}.NS"
+        try:
+            history = yf.Ticker(market_symbol).history(
+                period="5d", interval="1m", auto_adjust=False, raise_errors=False
+            )
+            if history.empty:
+                return None
+            latest = history.iloc[-1]
+            close = float(latest["Close"])
+            if not math.isfinite(close) or close <= 0:
+                return None
+            volume_value = latest.get("Volume")
+            volume = float(volume_value) if volume_value is not None else None
+            if volume is not None and not math.isfinite(volume):
+                volume = None
+            timestamp = int(history.index[-1].timestamp())
+            return Quote(symbol, close, volume, timestamp, self.source)
+        except Exception:
+            # yfinance can raise for network, symbol, pandas parsing, and upstream
+            # response errors. The service will retain prior data and mark it stale.
+            return None
+
+
 def choose_freshest(candidates: list[Quote]) -> Quote:
     """Newest provider timestamp wins; live provider wins a timestamp tie deterministically."""
-    priority = {"twelve_data": 2, "synthetic": 1}
+    priority = {"yfinance": 3, "twelve_data": 2, "synthetic": 1}
     return max(candidates, key=lambda item: (item.timestamp, priority.get(item.source, 0)))

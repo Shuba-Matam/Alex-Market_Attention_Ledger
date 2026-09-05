@@ -10,6 +10,7 @@ An attention-first market watchlist built for Groww Code 2026. It answers **what
 - Flags a symbol when any signal crosses its named threshold; it never hides the reason inside a blended score.
 - Keeps the latest 100 snapshots per symbol and returns the latest 20 for an inline sparkline.
 - Makes data age, source, and a resolved multi-source conflict visible in the UI.
+- Uses yfinance for live NSE OHLCV data (`RELIANCE` is queried as `RELIANCE.NS`) and falls back to deterministic synthetic data when it is unavailable.
 - Runs with no API key through a deterministic synthetic provider, including price-jump and volume-spike demo scenarios.
 
 ## Run it
@@ -28,7 +29,7 @@ npm run dev
 
 Visit the Vite URL printed in the second terminal (normally `http://localhost:5173`). Add a ticker, select **Mark all seen**, then select **Simulate activity** a few times to make the signals and sparkline evolve.
 
-To use optional live OHLCV data from Twelve Data in the backend terminal:
+Live NSE OHLCV data is attempted through yfinance without an API key. Twelve Data remains an optional additional source:
 
 ```powershell
 $env:TWELVE_DATA_API_KEY="your-key"
@@ -51,6 +52,6 @@ npm run build
 
 **Polling instead of streaming.** A 15-second backend poller and 10-second UI refresh give predictable, debuggable behaviour in a 72-hour build. The provider interface and cached snapshots isolate ingestion so WebSockets can replace polling later without changing the API or UI. Symbols are deduplicated across users before ingestion.
 
-**Resilience without pretending.** The synthetic source is deliberately a deterministic demo/resilience provider, not falsely described as live market data. Twelve Data is an optional OHLCV provider. When both report, the freshest provider timestamp wins, a fixed source-priority rule breaks ties, and the result retains provenance. Failure leaves the latest persisted data visible and eventually marked stale.
+**Resilience without pretending.** The synthetic source is deliberately a deterministic demo/resilience provider, not falsely described as live market data. yfinance provides live NSE OHLCV, and Twelve Data is an optional additional source. When sources report, the freshest provider timestamp wins, a fixed source-priority rule breaks ties, and the result retains provenance. Failure leaves the latest persisted data visible and eventually marked stale.
 
 **No AI feature.** Every alert is deterministic and auditable. The UI shows the exact signal that caused the flag, avoiding opaque or investment-advice-like recommendations.

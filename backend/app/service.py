@@ -5,7 +5,7 @@ import time
 from typing import Optional
 
 from .db import connection
-from .providers import SyntheticProvider, TwelveDataProvider, choose_freshest
+from .providers import SyntheticProvider, TwelveDataProvider, YFinanceProvider, choose_freshest
 
 PERSONAL_DELTA_THRESHOLD = 5.0
 ANOMALY_ZSCORE_THRESHOLD = 2.0
@@ -14,18 +14,51 @@ MAX_SNAPSHOTS_PER_SYMBOL = 100
 STALE_AFTER_SECONDS = 45
 MIN_HISTORY = 5
 
-# Fixed, representative OHLCV fixture for the first-run demo. It is deliberately
-# labelled demo_dataset in the API/UI and is never presented as live market data.
+def _demo_series(base: float, volume: int) -> list[tuple[float, int]]:
+    """Representative INR OHLCV fixture, spanning more than one market day."""
+    moves = (-0.016, -0.009, -0.004, 0.003, -0.006, 0.008, 0.013, 0.007, 0.018, 0.012, 0.024, 0.019)
+    return [(round(base * (1 + move), 2), int(volume * (0.84 + (index % 5) * 0.07)))
+            for index, move in enumerate(moves)]
+
+
+# Fixed Indian-market demo data. It is labelled demo_dataset and is never shown as
+# live market data. Prices remain numeric in SQLite; formatting occurs at the API/UI boundary.
 DEMO_SERIES: dict[str, list[tuple[float, int]]] = {
-    "AAPL": [(221.6, 48_300_000), (222.4, 45_100_000), (220.9, 49_800_000), (223.1, 46_700_000), (224.0, 47_900_000), (223.5, 44_900_000), (225.2, 51_100_000), (224.7, 46_500_000), (226.1, 48_800_000), (225.6, 47_200_000), (227.0, 50_300_000), (226.5, 45_600_000)],
-    "MSFT": [(412.4, 19_100_000), (413.1, 18_700_000), (411.8, 20_400_000), (414.2, 19_600_000), (415.0, 18_900_000), (414.6, 20_100_000), (416.3, 19_300_000), (415.7, 18_600_000), (417.1, 20_000_000), (416.8, 19_500_000), (418.2, 18_800_000), (417.9, 19_200_000)],
-    "NVDA": [(121.8, 214_000_000), (122.6, 218_000_000), (121.9, 209_000_000), (123.1, 221_000_000), (122.7, 216_000_000), (123.8, 224_000_000), (124.2, 219_000_000), (123.6, 212_000_000), (125.1, 226_000_000), (124.7, 220_000_000), (126.4, 224_000_000), (133.2, 746_000_000)],
-    "TSLA": [(244.8, 88_000_000), (242.9, 91_000_000), (245.4, 85_000_000), (243.7, 89_000_000), (241.9, 93_000_000), (242.6, 87_000_000), (240.8, 92_000_000), (239.7, 94_000_000), (241.1, 88_000_000), (240.4, 90_000_000), (238.9, 96_000_000), (237.6, 98_000_000)],
+    "RELIANCE": _demo_series(1_420, 4_800_000),
+    "TCS": _demo_series(3_860, 1_900_000),
+    "INFY": _demo_series(1_520, 5_400_000),
+    "HDFCBANK": _demo_series(1_770, 6_200_000),
+    "ICICIBANK": _demo_series(1_360, 8_300_000),
+    "SBIN": _demo_series(820, 12_100_000),
+    "BHARTIARTL": _demo_series(1_650, 4_100_000),
+    "ITC": _demo_series(470, 9_500_000),
+    "LT": _demo_series(3_640, 1_600_000),
+    "HINDUNILVR": _demo_series(2_370, 1_100_000),
+    "KOTAKBANK": _demo_series(1_940, 2_700_000),
+    "AXISBANK": _demo_series(1_150, 6_800_000),
 }
+
+
+def format_inr(amount: Optional[float]) -> Optional[str]:
+    """Format a numeric amount with Indian lakh/crore separators without changing storage."""
+    if amount is None:
+        return None
+    sign = "-" if amount < 0 else ""
+    whole, fraction = f"{abs(amount):.2f}".split(".")
+    if len(whole) > 3:
+        tail, prefix = whole[-3:], whole[:-3]
+        groups = []
+        while prefix:
+            groups.append(prefix[-2:])
+            prefix = prefix[:-2]
+        whole = ",".join(reversed(groups)) + "," + tail
+    return f"{sign}₹{whole}.{fraction}"
 
 
 def normalize_symbol(symbol: str) -> str:
     value = symbol.strip().upper()
+    if value.endswith(".NS"):
+        value = value[:-3]
     if not value or len(value) > 15 or not all(c.isalnum() or c in ".-" for c in value):
         raise ValueError("symbol must be 1-15 letters, numbers, dots, or hyphens")
     return value
@@ -41,6 +74,22 @@ def add_symbol(username: str, symbol: str) -> str:
         conn.execute("INSERT OR IGNORE INTO symbols(symbol, created_at) VALUES (?, ?)", (symbol, now))
         conn.execute("INSERT OR IGNORE INTO watchlist_items(username, symbol, created_at) VALUES (?, ?, ?)", (username, symbol, now))
     return symbol
+
+
+def initialize_seen_price(username: str, symbol: str) -> None:
+    """Set a first baseline only when this user has never seen this symbol."""
+    now = int(time.time())
+    with connection() as conn:
+        price = conn.execute(
+            "SELECT price FROM price_snapshots WHERE symbol=? ORDER BY provider_timestamp DESC, id DESC LIMIT 1",
+            (symbol,),
+        ).fetchone()
+        if price and price["price"] is not None:
+            conn.execute(
+                """INSERT OR IGNORE INTO user_symbol_state(username, symbol, last_seen_price, last_seen_at)
+                   VALUES (?, ?, ?, ?)""",
+                (username, symbol, price["price"], now),
+            )
 
 
 def seed_demo_watchlist() -> None:
@@ -60,7 +109,7 @@ def seed_demo_watchlist() -> None:
                 (symbol, now),
             )
             for index, (price, volume) in enumerate(series):
-                timestamp = now - (len(series) - index) * 300
+                timestamp = now - (len(series) - index - 1) * 10_800
                 conn.execute(
                     """INSERT INTO price_snapshots(symbol, price, volume, provider_timestamp, fetched_at, source, conflict_detected, candidate_sources)
                        VALUES (?, ?, ?, ?, ?, 'demo_dataset', 0, 'demo_dataset')""",
@@ -84,7 +133,7 @@ def remove_symbol(username: str, symbol: str) -> bool:
 def tick(symbol: Optional[str] = None, scenario: str = "normal") -> list[dict]:
     with connection() as conn:
         symbols = [normalize_symbol(symbol)] if symbol else [r["symbol"] for r in conn.execute("SELECT DISTINCT symbol FROM watchlist_items")]
-    synthetic, twelve = SyntheticProvider(), TwelveDataProvider()
+    synthetic, twelve, yfinance = SyntheticProvider(), TwelveDataProvider(), YFinanceProvider()
     result = []
     for item in symbols:
         with connection() as conn:
@@ -93,6 +142,9 @@ def tick(symbol: Optional[str] = None, scenario: str = "normal") -> list[dict]:
         live = twelve.quote(item)
         if live:
             candidates.append(live)
+        nse_quote = yfinance.quote(item)
+        if nse_quote:
+            candidates.append(nse_quote)
         winner = choose_freshest(candidates)
         now = int(time.time())
         sources = ",".join(sorted(q.source for q in candidates))
@@ -145,7 +197,7 @@ def watchlist(username: str) -> list[dict]:
                              WHERE w.username=? ORDER BY w.symbol""", (username,)).fetchall()
         result = []
         for item in items:
-            snapshots = conn.execute("SELECT * FROM price_snapshots WHERE symbol=? ORDER BY provider_timestamp DESC, id DESC LIMIT 20", (item["symbol"],)).fetchall()
+            snapshots = conn.execute("SELECT * FROM price_snapshots WHERE symbol=? ORDER BY provider_timestamp DESC, id DESC LIMIT 30", (item["symbol"],)).fetchall()
             if not snapshots:
                 result.append({"symbol": item["symbol"], "price": None, "volume": None, "source": None,
                                "provider_timestamp": None, "candidate_sources": [], "conflict_detected": False,
@@ -153,11 +205,24 @@ def watchlist(username: str) -> list[dict]:
                                "volume_spike_ratio": None, "flagged": False, "data_age_seconds": None, "is_stale": True})
                 continue
             latest = snapshots[0]
+            prior_session = next(
+                (snapshot for snapshot in snapshots[1:]
+                 if snapshot["provider_timestamp"] <= latest["provider_timestamp"] - 86_400),
+                None,
+            )
+            previous_close = prior_session["price"] if prior_session else None
+            previous_delta = (round((latest["price"] - previous_close) / previous_close * 100, 2)
+                              if previous_close not in (None, 0) else None)
             result.append({"symbol": item["symbol"], "price": latest["price"], "volume": latest["volume"],
+                           "price_display": format_inr(latest["price"]),
                            "source": latest["source"], "provider_timestamp": latest["provider_timestamp"],
                            "candidate_sources": latest["candidate_sources"].split(","),
                            "conflict_detected": bool(latest["conflict_detected"]),
-                           "recent_prices": list(reversed([r["price"] for r in snapshots])), **_signal(item, snapshots)})
+                           "recent_prices": list(reversed([r["price"] for r in snapshots])),
+                           "previous_session_close": previous_close,
+                           "previous_session_close_display": format_inr(previous_close),
+                           "previous_session_delta_pct": previous_delta,
+                           **_signal(item, snapshots)})
     return sorted(result, key=lambda x: (not x["flagged"], x["symbol"]))
 
 

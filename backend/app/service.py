@@ -134,22 +134,22 @@ def remove_symbol(username: str, symbol: str) -> bool:
         return conn.execute("DELETE FROM watchlist_items WHERE username=? AND symbol=?", (username, normalize_symbol(symbol))).rowcount > 0
 
 
-def _simulate_quote(symbol: str, last: Optional[object]) -> Quote:
+def _simulate_quote(symbol: str, last: Optional[object], last_real: Optional[object]) -> Quote:
     """A clearly-labelled random walk around the last real INR close, used only
     while that symbol's market is closed. The walk mean-reverts toward the real
-    close so a long weekend cannot drift prices into fantasy territory.
-    Generated rows carry source='simulated' so the UI can disclaim them; they
-    are never blended with live sources."""
+    close — taken from the latest real quote directly, never inferred from the
+    simulated chain — so a long weekend cannot drift prices into fantasy
+    territory. Generated rows carry source='simulated' so the UI can disclaim
+    them; they are never blended with live sources."""
     last_inr = last["price_inr"] if last and last["price_inr"] else None
     base = last_inr if last_inr and last_inr > 0 else 100.0
-    anchor = (last["previous_close_inr"] if last and last["previous_close_inr"] else None) or base
+    anchor = (last_real["price_inr"] if last_real and last_real["price_inr"] else None) or base
     step = random.gauss(0, 0.004) + 0.05 * (anchor - base) / base
     price = max(0.05, round(base * (1 + step), 2))
     base_volume = last["volume"] if last and last["volume"] else random.randint(500_000, 5_000_000)
     volume = int(base_volume * random.uniform(0.75, 1.35))
-    previous_close = last["previous_close_inr"] if last else None
     return Quote(symbol=symbol, price=price, volume=volume, timestamp=int(time.time()),
-                 source="simulated", currency="INR", previous_close=previous_close)
+                 source="simulated", currency="INR", previous_close=anchor)
 
 
 def _backfill_history(conn, symbol: str, currency: str, usd_to_inr: Optional[float], now: int) -> None:
@@ -203,12 +203,18 @@ def tick(symbol: Optional[str] = None) -> list[dict]:
                 last = conn.execute(
                     "SELECT price_inr, volume, previous_close_inr FROM price_snapshots WHERE symbol=? ORDER BY fetched_at DESC, id DESC LIMIT 1",
                     (item,)).fetchone()
-                if last is None:
+                last_real = conn.execute(
+                    "SELECT price_inr, volume, previous_close_inr FROM price_snapshots WHERE symbol=? AND source!='simulated' ORDER BY fetched_at DESC, id DESC LIMIT 1",
+                    (item,)).fetchone()
+                if last is None or last_real is None:
                     _backfill_history(conn, item, currency, usd_to_inr, now)
                     last = conn.execute(
                         "SELECT price_inr, volume, previous_close_inr FROM price_snapshots WHERE symbol=? ORDER BY fetched_at DESC, id DESC LIMIT 1",
                         (item,)).fetchone()
-            candidates = [_simulate_quote(item, last)]
+                    last_real = conn.execute(
+                        "SELECT price_inr, volume, previous_close_inr FROM price_snapshots WHERE symbol=? AND source!='simulated' ORDER BY fetched_at DESC, id DESC LIMIT 1",
+                        (item,)).fetchone()
+            candidates = [_simulate_quote(item, last, last_real)]
 
         converted = {quote.source: convert_to_inr(quote.price, quote.currency, usd_to_inr) for quote in candidates}
         conflict = len(candidates) > 1 and is_conflict(converted[candidates[0].source], converted[candidates[1].source])

@@ -315,7 +315,9 @@ def _signal(row, snapshots: list) -> dict:
             deviation = statistics.pstdev(prior_prices)
             if deviation > 0:
                 zscore = round((real[0]["price_inr"] - statistics.mean(prior_prices)) / deviation, 2)
-        if real[0]["volume"] is not None and len(prior_volumes) >= MIN_HISTORY:
+        # A zero-volume current bar (e.g. Yahoo's in-progress bar right at open)
+        # would render as a meaningless 0.00x — show a dash instead.
+        if real[0]["volume"] is not None and real[0]["volume"] > 0 and len(prior_volumes) >= MIN_HISTORY:
             mean_volume = statistics.mean(prior_volumes)
             if mean_volume > 0:
                 volume_ratio = round(real[0]["volume"] / mean_volume, 2)

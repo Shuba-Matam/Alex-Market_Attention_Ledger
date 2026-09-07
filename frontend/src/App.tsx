@@ -116,7 +116,7 @@ function WelcomeScreen({ user, items, loading, onEnter }: { user: string; items:
         ? movers.map((item) => <button key={item.symbol ?? item.ticker} onClick={onEnter}><strong>{item.symbol ?? item.ticker}</strong><small>{pct(item.personal_delta_pct)} since you looked · open row →</small></button>)
         : items.length ? <p className="lede">Your ledger is exactly as you left it.</p> : null}
     </section>}
-    {anySimulated && <p className="lede sim-note">Markets are asleep — nothing has changed in the real market since the last session. Rows marked SIMULATED are generated from the last real close to keep the signals warm.</p>}
+    {anySimulated && <p className="lede sim-note">Some watched markets are still asleep — rows marked SIMULATED are generated from the last real close, not live prices. Live markets are updating normally.</p>}
     <footer><button onClick={onEnter} disabled={loading}>Open the full ledger →</button></footer>
   </main>;
 }
@@ -160,7 +160,8 @@ export default function App() {
     if (!withDelta.length) return null;
     const biggest = withDelta.reduce((a, b) => Math.abs(numeric(b.personal_delta_pct)!) > Math.abs(numeric(a.personal_delta_pct)!) ? b : a);
     const move = numeric(biggest.personal_delta_pct)!;
-    return `${flagged ? `${flagged} of ${items.length} need attention · ` : ""}biggest move since you left: ${biggest.symbol ?? biggest.ticker} ${move > 0 ? "+" : ""}${move.toFixed(2)}%`;
+    const simTag = biggest.simulated ? " (simulated)" : "";
+    return `${flagged ? `${flagged} of ${items.length} need attention · ` : ""}biggest move since you left: ${biggest.symbol ?? biggest.ticker} ${move > 0 ? "+" : ""}${move.toFixed(2)}%${simTag}`;
   }, [items]);
   const anySimulated = items.some((i) => i.simulated);
   const login = (next: string) => { localStorage.setItem("watch-ledger-user", next); setExpanded(null); setItems([]); setUser(next); setWelcome(true); };
@@ -182,6 +183,6 @@ export default function App() {
       <div className="actions"><button onClick={() => void action(() => api.markSeen(user))} disabled={busy || !items.length}>Mark all seen</button><button onClick={() => void action(api.tick)} disabled={busy}>Refresh prices</button></div>
     </section>
     <section className="ledger" aria-live="polite"><div className="ledger-head"><span>{items.length} watched</span>{digest && <span className="digest">{digest}</span>}<span>{updated ? `updated ${updated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "connecting…"}</span></div>{loading ? <div className="state">Opening your ledger…</div> : error ? <div className="state error"><strong>Market service unavailable.</strong><span>{error}</span><button onClick={() => void refresh()}>Try again</button></div> : !items.length ? <div className="state"><strong>Your watchlist is empty.</strong><span>Add a ticker to start noticing change, not just prices.</span></div> : <div className="rows">{sorted.map(({ item, index }) => { const key = item.symbol ?? item.ticker ?? String(index); return <Row key={key} item={item} expanded={expanded === key} onToggle={() => setExpanded(expanded === key ? null : key)} onDelete={() => void action(() => api.removeSymbol(user!, key))} />; })}</div>}</section>
-    <footer>{anySimulated && <span className="sim-note">Market asleep: rows marked SIMULATED are generated from the last real close so the change signals keep running — not live prices. </span>}<span className="dot" /> {stats ? `${stats.unique_symbols} unique symbols tracked across ${stats.users} users — ingestion is deduplicated per symbol, not per viewer. ` : ""}Refreshes every 10 seconds · flag = a personal move &gt;5%, price anomaly &gt;2σ, or volume &gt;2× · Alex - Market Attention Ledger</footer>
+    <footer>{anySimulated && <span className="sim-note">Rows marked SIMULATED belong to markets that are asleep — not live prices. </span>}<span className="dot" /> {stats ? `${stats.unique_symbols} unique symbols tracked across ${stats.users} users — ingestion is deduplicated per symbol, not per viewer. ` : ""}Refreshes every 10 seconds · flag = a personal move &gt;5%, price anomaly &gt;2σ, or volume &gt;2× · Alex - Market Attention Ledger</footer>
   </main>;
 }

@@ -170,7 +170,7 @@ def test_seeded_users_and_stats(monkeypatch):
             client.as_new_user()
             users = client.get("/users").json()["users"]
             # /users lists demo accounts only; registered accounts are not enumerated.
-            assert set(users) == {"demo", "aarav", "priya", "rohan"}
+            assert set(users) == {"demo"}
             assert client.username not in users
             # Seeding is idempotent.
             with TestClient(app) as again:
@@ -505,7 +505,7 @@ def test_seeded_watchlists_get_baselines_from_first_real_poll(monkeypatch):
                             lambda self, symbol: _quote(1420.0, int(time.time()) - 7_200))  # asleep
         with TestClient(app) as raw_client:
             client = AuthedClient(raw_client)
-            client.as_demo("priya")
+            client.as_demo("demo")
             client.post("/poll", json={"symbol": "INFY"})  # sim rows only, symbol's first data
             data = next(i for i in client.items() if i["symbol"] == "INFY")
             assert data["simulated"] is True

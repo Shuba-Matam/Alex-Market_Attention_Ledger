@@ -59,15 +59,12 @@ def normalize_symbol(symbol: str) -> str:
     return value
 
 
-DEMO_USERS = ("demo", "aarav", "priya", "rohan")
+DEMO_USERS = ("demo",)
 
 # Starter watchlists so every seeded account opens with something to look at.
 # Seeded once, only when the user has no items - never overrides user edits.
 SEED_WATCHLISTS = {
     "demo": ("INFY", "RELIANCE", "TCS"),
-    "aarav": ("TCS", "HDFCBANK", "TATASTEEL", "AAPL"),
-    "priya": ("INFY", "SBIN", "ITC", "MSFT"),
-    "rohan": ("RELIANCE", "BHARTIARTL", "AAPL", "NVDA"),
 }
 
 
@@ -89,6 +86,9 @@ def seed_users() -> None:
                 conn.execute("INSERT OR IGNORE INTO symbols(symbol, created_at) VALUES (?, ?)", (symbol, now))
                 conn.execute("INSERT OR IGNORE INTO watchlist_items(user_id, symbol, created_at) VALUES (?, ?, ?)",
                              (user_id, symbol, now))
+        # Only one public demo account is exposed now. Older seeds are removed
+        # with their watchlists and state via ON DELETE CASCADE.
+        conn.execute("DELETE FROM users WHERE is_demo=1 AND username NOT IN ('demo')")
 
 
 def list_users() -> list[str]:
@@ -111,7 +111,8 @@ def _unique_username(conn, base: str) -> str:
 
 
 def _session(row) -> dict:
-    return {"user_id": row["id"], "username": row["username"], "token": auth.make_token(row["id"])}
+    return {"user_id": row["id"], "username": row["username"],
+            "token": auth.make_token(row["id"], row["token_version"])}
 
 
 def register_user(email: str, password: str) -> dict:
@@ -130,14 +131,15 @@ def register_user(email: str, password: str) -> dict:
             "INSERT INTO users(username, created_at, email, password_hash) VALUES (?, ?, ?, ?)",
             (username, now, email, auth.hash_password(password)))
         return {"user_id": cursor.lastrowid, "username": username,
-                "token": auth.make_token(cursor.lastrowid)}
+                "token": auth.make_token(cursor.lastrowid, 0)}
 
 
 def login_user(email: str, password: str) -> dict:
     email = (email or "").strip().lower()
     with connection() as conn:
         row = conn.execute(
-            "SELECT id, username, password_hash FROM users WHERE email=? AND is_demo=0", (email,)).fetchone()
+            "SELECT id, username, password_hash, token_version FROM users WHERE email=? AND is_demo=0",
+            (email,)).fetchone()
         if row is None or not auth.verify_password(password or "", row["password_hash"]):
             raise AuthError("wrong email or password")
         return _session(row)
@@ -146,7 +148,9 @@ def login_user(email: str, password: str) -> dict:
 def login_demo(username: str) -> dict:
     """Issue a real session for a seeded demo account."""
     with connection() as conn:
-        row = conn.execute("SELECT id, username FROM users WHERE username=? AND is_demo=1", (username,)).fetchone()
+        row = conn.execute(
+            "SELECT id, username, token_version FROM users WHERE username=? AND is_demo=1",
+            (username,)).fetchone()
         if row is None:
             raise AuthError("unknown demo account")
         return _session(row)
@@ -163,11 +167,13 @@ def login_with_google(credential: str) -> dict:
     now = int(time.time())
     with connection() as conn:
         row = conn.execute(
-            "SELECT id, username FROM users WHERE google_sub=? AND is_demo=0", (claims["sub"],)).fetchone()
+            "SELECT id, username, token_version FROM users WHERE google_sub=? AND is_demo=0",
+            (claims["sub"],)).fetchone()
         if row:
             return _session(row)
         existing = conn.execute(
-            "SELECT id, username FROM users WHERE email=? AND is_demo=0", (claims["email"],)).fetchone()
+            "SELECT id, username, token_version FROM users WHERE email=? AND is_demo=0",
+            (claims["email"],)).fetchone()
         if existing:
             conn.execute("UPDATE users SET google_sub=? WHERE id=?", (claims["sub"], existing["id"]))
             return _session(existing)
@@ -176,16 +182,18 @@ def login_with_google(credential: str) -> dict:
             "INSERT INTO users(username, created_at, email, google_sub) VALUES (?, ?, ?, ?)",
             (username, now, claims["email"], claims["sub"]))
         return {"user_id": cursor.lastrowid, "username": username,
-                "token": auth.make_token(cursor.lastrowid)}
+                "token": auth.make_token(cursor.lastrowid, 0)}
 
 
 def user_by_id(user_id: int) -> Optional[dict]:
     """Resolve a token subject to an account, or None if it no longer exists."""
     with connection() as conn:
-        row = conn.execute("SELECT id, username, is_demo FROM users WHERE id=?", (user_id,)).fetchone()
+        row = conn.execute(
+            "SELECT id, username, is_demo, token_version FROM users WHERE id=?", (user_id,)).fetchone()
     if row is None:
         return None
-    return {"user_id": row["id"], "username": row["username"], "is_demo": bool(row["is_demo"])}
+    return {"user_id": row["id"], "username": row["username"], "is_demo": bool(row["is_demo"]),
+            "token_version": row["token_version"]}
 
 
 def user_watchlist_symbols(user_id: int) -> list[str]:
@@ -525,3 +533,58 @@ def mark_seen(user_id: int) -> int:
                                 ON CONFLICT(user_id,symbol) DO UPDATE SET last_seen_price=excluded.last_seen_price,last_seen_at=excluded.last_seen_at""",
                              (user_id, row["symbol"], row["price"], now))
     return len(rows)
+
+
+def request_password_reset(email: str) -> Optional[dict]:
+    """Create a single-use reset code for a registered account.
+
+    Returns {"email", "code"} only when the account exists. The route returns
+    the same response either way, so this cannot be used to discover accounts.
+    """
+    email = (email or "").strip().lower()
+    if not auth.valid_email(email):
+        return None
+    now = int(time.time())
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT id, email FROM users WHERE email=? AND is_demo=0", (email,)).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM password_resets WHERE user_id=? OR expires_at<?", (row["id"], now))
+        code = auth.generate_reset_code()
+        conn.execute(
+            """INSERT INTO password_resets(user_id, code_hash, expires_at, attempts, created_at)
+               VALUES (?, ?, ?, 0, ?)""",
+            (row["id"], auth.hash_reset_code(code), now + auth.RESET_CODE_TTL_SECONDS, now))
+    return {"email": row["email"], "code": code}
+
+
+def reset_password(email: str, code: str, new_password: str) -> None:
+    """Consume a reset code, set the new password, and revoke existing sessions."""
+    email = (email or "").strip().lower()
+    code = (code or "").strip()
+    if len(new_password or "") < auth.MIN_PASSWORD_LENGTH:
+        raise AuthError(f"password must be at least {auth.MIN_PASSWORD_LENGTH} characters")
+    now = int(time.time())
+    with connection() as conn:
+        row = conn.execute(
+            """SELECT u.id, r.id AS reset_id, r.code_hash, r.expires_at, r.attempts
+               FROM users u JOIN password_resets r ON r.user_id=u.id
+               WHERE u.email=? AND u.is_demo=0
+               ORDER BY r.created_at DESC, r.id DESC LIMIT 1""",
+            (email,)).fetchone()
+        if row is None:
+            raise AuthError("invalid or expired reset code")
+        if row["expires_at"] < now or row["attempts"] >= auth.RESET_MAX_ATTEMPTS:
+            conn.execute("DELETE FROM password_resets WHERE id=?", (row["reset_id"],))
+            conn.commit()
+            raise AuthError("invalid or expired reset code")
+        if not auth.verify_reset_code(code, row["code_hash"]):
+            conn.execute("UPDATE password_resets SET attempts=attempts+1 WHERE id=?",
+                         (row["reset_id"],))
+            conn.commit()
+            raise AuthError("invalid or expired reset code")
+        conn.execute(
+            "UPDATE users SET password_hash=?, token_version=token_version+1 WHERE id=?",
+            (auth.hash_password(new_password), row["id"]))
+        conn.execute("DELETE FROM password_resets WHERE user_id=?", (row["id"],))

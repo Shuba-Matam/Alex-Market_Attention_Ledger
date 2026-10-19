@@ -1,9 +1,7 @@
 # Render free-tier deployment for the backend.
-# NOTE on free tier: the service sleeps after ~15 min without traffic (the
-# background poller only runs while awake) and SQLite lives on an ephemeral
-# disk — data survives restarts of the running service but is reset on
-# redeploy. Attach a paid persistent disk (or use Railway volumes) if the
-# demo must survive redeploys.
+# NOTE: the service sleeps after ~15 min without traffic (the poller only runs
+# while awake), SQLite is ephemeral (data resets on redeploy), and outbound SMTP
+# is blocked. Reset codes use the free Gmail Apps Script relay over HTTPS.
 services:
   - type: web
     name: alex-watchlist-api
@@ -12,6 +10,8 @@ services:
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    # Free tier: no persistent disk and no outbound SMTP. SQLite resets on
+    # redeploy; reset codes go through a free Gmail Apps Script relay over HTTPS.
     envVars:
       - key: TWELVE_DATA_API_KEY
         sync: false
@@ -19,6 +19,10 @@ services:
         sync: false   # optional; enables Google sign-in when set
       - key: AUTH_SECRET
         generateValue: true   # stable signing key, so redeploys keep sessions valid
+      - key: GMAIL_RELAY_URL
+        sync: false   # Apps Script web app /exec URL
+      - key: GMAIL_RELAY_SECRET
+        sync: false   # shared secret checked by the script
       - key: ALLOWED_ORIGINS
         sync: false   # set to your deployed frontend URL, e.g. https://watchme.vercel.app
       - key: POLL_INTERVAL_SECONDS

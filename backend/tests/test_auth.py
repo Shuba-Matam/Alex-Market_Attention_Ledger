@@ -102,7 +102,7 @@ def test_identity_cannot_be_claimed_by_registering_a_name(client):
 def test_registered_users_are_not_enumerated(client):
     _register(client, email="private@example.com")
     users = client.get("/users").json()["users"]
-    assert set(users) == {"demo", "aarav", "priya", "rohan"}
+    assert set(users) == {"demo"}
 
 
 def test_demo_accounts_need_a_token_but_no_password(client):
@@ -207,6 +207,50 @@ def test_deleting_a_user_cascades(client):
         items = conn.execute("SELECT COUNT(*) AS n FROM watchlist_items WHERE user_id=?", (alice.user_id,)).fetchone()["n"]
         state = conn.execute("SELECT COUNT(*) AS n FROM user_symbol_state WHERE user_id=?", (alice.user_id,)).fetchone()["n"]
     assert items == 0 and state == 0
+
+
+def test_password_reset_with_otp(client, monkeypatch):
+    from app import emailer
+
+    sent = {}
+    monkeypatch.setattr(emailer, "send_password_reset_code",
+                        lambda to_email, code: sent.update(email=to_email, code=code))
+    old_token = _register(client).json()["token"]
+
+    forgot = client.post("/auth/forgot-password", json={"email": "user@example.com"})
+    assert forgot.status_code == 200
+    assert sent["email"] == "user@example.com" and len(sent["code"]) == 6
+
+    # A wrong code fails without consuming the real one.
+    wrong = client.post("/auth/reset-password", json={
+        "email": "user@example.com", "code": "000000", "new_password": "brand new password"})
+    assert wrong.status_code == 400
+
+    reset = client.post("/auth/reset-password", json={
+        "email": "user@example.com", "code": sent["code"], "new_password": "brand new password"})
+    assert reset.status_code == 200
+
+    # Existing sessions are revoked by the token_version bump.
+    assert client.get("/watchlist", headers=_headers(old_token)).status_code == 401
+    # The old password stops working; the new one signs in.
+    assert client.post("/auth/login", json={"email": "user@example.com",
+                                            "password": "correct horse battery"}).status_code == 401
+    assert client.post("/auth/login", json={"email": "user@example.com",
+                                            "password": "brand new password"}).status_code == 200
+    # Codes are single-use.
+    again = client.post("/auth/reset-password", json={
+        "email": "user@example.com", "code": sent["code"], "new_password": "another password"})
+    assert again.status_code == 400
+
+
+def test_forgot_password_does_not_reveal_accounts(client, monkeypatch):
+    from app import emailer
+
+    calls = []
+    monkeypatch.setattr(emailer, "send_password_reset_code", lambda *args: calls.append(args))
+    response = client.post("/auth/forgot-password", json={"email": "missing@example.com"})
+    assert response.status_code == 200
+    assert calls == []
 
 
 def test_login_is_throttled_after_repeated_failures(client):

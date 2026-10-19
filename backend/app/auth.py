@@ -28,6 +28,8 @@ TOKEN_LIFETIME_SECONDS = 30 * 24 * 3600
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P, _SCRYPT_DKLEN = 2**14, 8, 1, 32
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MIN_PASSWORD_LENGTH = 8
+RESET_CODE_TTL_SECONDS = 10 * 60
+RESET_MAX_ATTEMPTS = 5
 _GOOGLE_ISSUERS = ("accounts.google.com", "https://accounts.google.com")
 
 # Sign-in throttling: at most this many failures per key inside the window.
@@ -93,32 +95,55 @@ def verify_password(password: str, stored: Optional[str]) -> bool:
         return False
 
 
-def make_token(user_id: int, now: Optional[int] = None) -> str:
+def make_token(user_id: int, token_version: int = 0, now: Optional[int] = None) -> str:
     expiry = int(now if now is not None else time.time()) + TOKEN_LIFETIME_SECONDS
-    payload = f"{user_id}.{expiry}"
+    payload = f"{user_id}.{int(token_version)}.{expiry}"
     signature = hmac.new(_secret(), payload.encode(), hashlib.sha256).hexdigest()
     return f"{payload}.{signature}"
 
 
-def verify_token(token: Optional[str], now: Optional[int] = None) -> Optional[int]:
-    """Return the user id for a valid, unexpired token; None otherwise."""
+def verify_token(token: Optional[str], now: Optional[int] = None) -> Optional[tuple[int, int]]:
+    """Return (user_id, token_version) for a valid, unexpired token; None otherwise."""
     if not token:
         return None
     parts = token.split(".")
-    if len(parts) != 3:
+    if len(parts) != 4:
         return None
-    subject, expiry_raw, signature = parts
-    payload = f"{subject}.{expiry_raw}"
+    subject, version_raw, expiry_raw, signature = parts
+    payload = f"{subject}.{version_raw}.{expiry_raw}"
     expected = hmac.new(_secret(), payload.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(signature, expected):
         return None
     try:
-        user_id, expiry = int(subject), int(expiry_raw)
+        user_id, token_version, expiry = int(subject), int(version_raw), int(expiry_raw)
     except ValueError:
         return None
     if expiry < int(now if now is not None else time.time()):
         return None
-    return user_id
+    return user_id, token_version
+
+
+def generate_reset_code() -> str:
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def hash_reset_code(code: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", code.encode(), salt, 120_000)
+    return f"pbkdf2${salt.hex()}${digest.hex()}"
+
+
+def verify_reset_code(code: str, stored: Optional[str]) -> bool:
+    if not stored:
+        return False
+    try:
+        scheme, salt_hex, digest_hex = stored.split("$")
+        if scheme != "pbkdf2":
+            return False
+        digest = hashlib.pbkdf2_hmac("sha256", code.encode(), bytes.fromhex(salt_hex), 120_000)
+        return hmac.compare_digest(digest.hex(), digest_hex)
+    except (ValueError, TypeError):
+        return False
 
 
 def bearer_token(authorization: Optional[str]) -> Optional[str]:

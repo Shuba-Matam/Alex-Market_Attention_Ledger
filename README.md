@@ -6,7 +6,7 @@ An attention-first market watchlist built for Groww Code 2026. It answers **what
 
 ## Screenshots
 
-**Login** — create an account with email or Google, or open a shared demo ledger; state persists per user across sessions and devices.
+**Login** — create an account with email or Google, reset a password with a Gmail OTP, or open the shared demo account from the dropdown; state persists per user across sessions and devices.
 
 ![Login](screenshots/01-login.png)
 
@@ -62,8 +62,16 @@ $env:TWELVE_DATA_API_KEY="your-key"
 
 ## Deploy
 
-- **Backend**: `render.yaml` deploys to Render's free tier. Caveats: free-tier services sleep after ~15 minutes without traffic (the background poller only runs while awake — expect a ~30s cold start), and SQLite sits on an ephemeral disk, so data survives restarts but resets on redeploy. `AUTH_SECRET` is generated once by Render and kept, so redeploys do not sign everyone out. Set `TWELVE_DATA_API_KEY`, `ALLOWED_ORIGINS` (the frontend URL, comma-separated), and optionally `GOOGLE_CLIENT_ID` in the dashboard.
+- **Backend**: `render.yaml` deploys the API. On Render's free tier it sleeps after ~15 minutes without traffic (the background poller only runs while awake — expect a ~30s cold start), SQLite is ephemeral, and outbound SMTP is blocked. Set `TWELVE_DATA_API_KEY`, `ALLOWED_ORIGINS` (the frontend URL, comma-separated), `GOOGLE_CLIENT_ID`, `GMAIL_RELAY_URL`, and `GMAIL_RELAY_SECRET` in the dashboard. `AUTH_SECRET` is generated once by Render and kept, so redeploys do not sign everyone out.
 - **Frontend**: Vercel/Netlify, root directory `frontend/`, with `VITE_API_BASE` set to the backend URL at build time (see `frontend/.env.example`). `VITE_GOOGLE_CLIENT_ID` is optional; the backend normally supplies the ID through `/auth/config`.
+
+**Free-tier limits.** There is no persistent disk and no outbound SMTP on Render Free. SQLite (accounts, watchlists, seen state) therefore resets on every redeploy or restart, and reset codes must travel over HTTPS. For durable data at zero cost, move the database to a free external Postgres (Neon/Supabase) — that is a code change — or accept the reset.
+
+## Password reset
+
+Reset uses a 6-digit OTP, not a link. `POST /auth/forgot-password` always returns 200, whether or not the address exists. `POST /auth/reset-password` consumes the code once; codes expire after 10 minutes and allow five attempts. A successful reset bumps `users.token_version`, so every existing session for that account is revoked immediately.
+
+Email is sent from Gmail without SMTP: deploy [`docs/gmail-relay.gs`](docs/gmail-relay.gs) as a free Apps Script web app (Execute as: Me; Who has access: Anyone), then set `GMAIL_RELAY_URL` to its `/exec` URL and `GMAIL_RELAY_SECRET` to the same shared secret used in the script. The backend POSTs over HTTPS, which Render Free allows; a consumer Gmail account can send about 100 recipients per day. Without relay configuration the code is printed to the server log for local development.
 
 ## Verification
 
@@ -83,7 +91,7 @@ Tests mock both providers at the boundary (no network) and include regression te
 
 **Storing less, more honestly.** Snapshots are persisted only when the market event changes; feed freshness lives in `symbols.last_polled_at`, so a stable market is never mistaken for a broken feed.
 
-**Real accounts, minimal surface.** Registration and email/password sign-in use scrypt hashes with per-user salts; sessions are HMAC-signed 30-day tokens whose subject is the immutable `users.id`, so a rename cannot re-point a session at another ledger. Repeated failed sign-ins are throttled per IP + email (8 failures / 15 minutes). Google Sign-In verifies the ID token audience and requires a verified email before issuing a session; demo accounts are passwordless but still token-authenticated. Tokens live in `localStorage` (readable by XSS) — an httpOnly cookie is the next hardening step. Password reset, email verification, and distributed rate limiting are deliberately not built for this demo.
+**Real accounts, minimal surface.** Registration and email/password sign-in use scrypt hashes with per-user salts; sessions are HMAC-signed 30-day tokens carrying the immutable `users.id` and a `token_version`, so renaming cannot re-point a session and a password reset revokes every older token. Repeated failed sign-ins are throttled per IP + email (8 failures / 15 minutes). Google Sign-In verifies the ID token audience and requires a verified email before issuing a session. One passwordless demo account remains, opened from a dropdown; it is still token-authenticated. Tokens live in `localStorage` (readable by XSS) — an httpOnly cookie is the next hardening step. Email verification and distributed rate limiting remain out of scope.
 
 **No AI feature.** Every signal is deterministic and auditable. The UI shows the exact threshold that caused a flag, avoiding opaque or investment-advice-like recommendations.
 

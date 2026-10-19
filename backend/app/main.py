@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from . import auth
+from . import auth, emailer
 from .db import connection, init_db
 from .providers import YahooChartProvider
 from .service import (
@@ -22,6 +22,8 @@ from .service import (
     mark_seen,
     register_user,
     remove_symbol,
+    request_password_reset,
+    reset_password,
     seed_users,
     stats,
     tick,
@@ -75,7 +77,7 @@ def _has_any_data(symbol: str) -> bool:
         return row is not None
 
 
-app = FastAPI(title="Alex Watchlist API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Alex Watchlist API", version="3.1.0", lifespan=lifespan)
 _allowed_origins = [origin.strip() for origin in os.getenv(
     "ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if origin.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=_allowed_origins,
@@ -103,6 +105,16 @@ class GoogleBody(BaseModel):
     credential: str = Field(min_length=1, max_length=4096)
 
 
+class ForgotPasswordBody(BaseModel):
+    email: str = Field(min_length=3, max_length=120)
+
+
+class ResetPasswordBody(BaseModel):
+    email: str = Field(min_length=3, max_length=120)
+    code: str = Field(min_length=6, max_length=6)
+    new_password: str = Field(min_length=1, max_length=200)
+
+
 def current_user(authorization: Optional[str] = Header(None)) -> dict:
     """Resolve the caller from their bearer token.
 
@@ -110,9 +122,10 @@ def current_user(authorization: Optional[str] = Header(None)) -> dict:
     a username from the path or body, so a caller cannot address another user's
     ledger at all.
     """
-    user_id = auth.verify_token(auth.bearer_token(authorization))
-    user = user_by_id(user_id) if user_id is not None else None
-    if user is None:
+    subject = auth.verify_token(auth.bearer_token(authorization))
+    user = user_by_id(subject[0]) if subject is not None else None
+    # token_version is bumped on password reset, which revokes older sessions.
+    if user is None or user["token_version"] != subject[1]:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user
 
@@ -169,6 +182,43 @@ def post_google(body: GoogleBody):
         return login_with_google(body.credential)
     except AuthError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
+
+
+@app.post("/auth/forgot-password")
+def post_forgot_password(body: ForgotPasswordBody, request: Request):
+    key = f"reset:{request.client.host if request.client else 'unknown'}:{body.email.strip().lower()}"
+    wait = auth.rate_limit_wait(key)
+    if wait > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many reset requests. Try again in {math.ceil(wait / 60)} minute(s).",
+            headers={"Retry-After": str(math.ceil(wait))},
+        )
+    auth.record_auth_failure(key)
+    result = request_password_reset(body.email)
+    if result:
+        emailer.send_password_reset_code(result["email"], result["code"])
+    # Same answer whether or not the address exists.
+    return {"ok": True}
+
+
+@app.post("/auth/reset-password")
+def post_reset_password(body: ResetPasswordBody, request: Request):
+    key = f"reset:{request.client.host if request.client else 'unknown'}:{body.email.strip().lower()}"
+    wait = auth.rate_limit_wait(key)
+    if wait > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many reset attempts. Try again in {math.ceil(wait / 60)} minute(s).",
+            headers={"Retry-After": str(math.ceil(wait))},
+        )
+    try:
+        reset_password(body.email, body.code, body.new_password)
+    except AuthError as error:
+        auth.record_auth_failure(key)
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    auth.clear_auth_failures(key)
+    return {"ok": True}
 
 
 @app.post("/auth/demo")

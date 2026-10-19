@@ -242,18 +242,61 @@ function GoogleButton({ clientId, onSession, onError }: { clientId: string; onSe
 }
 
 function LoginScreen({ users, googleClientId, onDemo, onSession }: { users: string[]; googleClientId: string | null; onDemo: (user: string) => void; onSession: (s: Session) => void }) {
+  const [mode, setMode] = useState<"signin" | "forgot" | "reset">("signin");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [resetCode, setResetCode] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [demoUser, setDemoUser] = useState(users[0] ?? "demo");
   const [authError, setAuthError] = useState("");
+  const [notice, setNotice] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
 
-  const submit = async (mode: "login" | "register") => {
+  useEffect(() => {
+    if (users.length && !users.includes(demoUser)) setDemoUser(users[0]);
+  }, [users, demoUser]);
+
+  const submit = async (kind: "login" | "register") => {
     setAuthBusy(true);
     setAuthError("");
+    setNotice("");
     try {
-      onSession(mode === "login" ? await api.login(email, password) : await api.register(email, password));
+      onSession(kind === "login" ? await api.login(email, password) : await api.register(email, password));
     } catch (e) {
       setAuthError(e instanceof Error ? e.message : "Something went wrong.");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const requestCode = async () => {
+    setAuthBusy(true);
+    setAuthError("");
+    setNotice("");
+    try {
+      await api.forgotPassword(email);
+      setMode("reset");
+      setNotice("If that email has an account, a 6-digit code is on its way. It expires in 10 minutes.");
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : "Could not send a reset code.");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const resetPassword = async () => {
+    setAuthBusy(true);
+    setAuthError("");
+    setNotice("");
+    try {
+      await api.resetPassword(email, resetCode, newPassword);
+      setMode("signin");
+      setPassword("");
+      setResetCode("");
+      setNewPassword("");
+      setNotice("Password updated. Sign in with your new password.");
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : "Could not reset the password.");
     } finally {
       setAuthBusy(false);
     }
@@ -263,28 +306,47 @@ function LoginScreen({ users, googleClientId, onDemo, onSession }: { users: stri
 
   return <main className="login">
     <header><p className="eyebrow">Alex - Market Attention Ledger</p><h1>Who is<br /><em>checking in?</em></h1>
-      <p className="lede">Create your own account with email or Google - your watchlist is private to you. Demo accounts are shared and open to anyone.</p></header>
+      <p className="lede">Create your own account with email or Google - your watchlist is private to you. The demo account is shared and open to anyone.</p></header>
     <section className="email-auth" aria-label="Sign in">
-      <form onSubmit={(e) => { e.preventDefault(); void submit("login"); }}>
-        <label>Email<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" /></label>
-        <label>Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="8+ characters" autoComplete="current-password" minLength={8} /></label>
-        <div className="auth-buttons">
-          <button type="submit" disabled={authBusy || !email || !password}>Sign in</button>
-          <button type="button" disabled={authBusy || !email || password.length < 8} onClick={() => void submit("register")}>Create account</button>
-        </div>
-      </form>
-      {googleClientId && <div className="google-row"><span className="or">or</span>
+      {mode === "signin" ? <>
+        <form onSubmit={(e) => { e.preventDefault(); void submit("login"); }}>
+          <label>Email<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" /></label>
+          <label>Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="8+ characters" autoComplete="current-password" minLength={8} /></label>
+          <div className="auth-buttons">
+            <button type="submit" disabled={authBusy || !email || !password}>Sign in</button>
+            <button type="button" disabled={authBusy || !email || password.length < 8} onClick={() => void submit("register")}>Create account</button>
+          </div>
+        </form>
+        <button type="button" className="auth-link" onClick={() => { setMode("forgot"); setAuthError(""); setNotice(""); }}>Forgot password?</button>
+      </> : <>
+        <form onSubmit={(e) => { e.preventDefault(); void (mode === "forgot" ? requestCode() : resetPassword()); }}>
+          <label>Email<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" readOnly={mode === "reset"} /></label>
+          {mode === "reset" && <label>6-digit code<input inputMode="numeric" pattern="[0-9]{6}" maxLength={6} value={resetCode} onChange={(e) => setResetCode(e.target.value.replace(/\D/g, ""))} placeholder="000000" autoComplete="one-time-code" required /></label>}
+          {mode === "reset" && <label>New password<input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder="8+ characters" autoComplete="new-password" minLength={8} required /></label>}
+          <div className="auth-buttons">
+            <button type="submit" disabled={authBusy || !email || (mode === "reset" && (resetCode.length !== 6 || newPassword.length < 8))}>{mode === "forgot" ? "Send code" : "Reset password"}</button>
+            <button type="button" disabled={authBusy} onClick={() => { setMode("signin"); setAuthError(""); setNotice(""); }}>Back</button>
+          </div>
+        </form>
+      </>}
+      {mode === "signin" && googleClientId && <div className="google-row"><span className="or">or</span>
         <GoogleButton clientId={googleClientId} onSession={onSession} onError={showError} /></div>}
       {authError && <p className="error">{authError}</p>}
+      {notice && <p className="notice">{notice}</p>}
       <small>Your account is private - only your signed-in session can open your ledger.</small>
     </section>
-    <section className="user-picker" aria-label="Demo accounts">
-      <p className="picker-note">Or explore a shared demo ledger (no password, open by design):</p>
+    <section className="user-picker" aria-label="Demo account">
+      <p className="picker-note">Or explore the shared demo ledger (no password, open by design):</p>
       {users.length
-        ? users.map((user) => <button key={user} onClick={() => onDemo(user)}><strong>{user}</strong><small>open demo ledger →</small></button>)
-        : <p className="lede">Loading demo accounts…</p>}
+        ? <form className="demo-form" onSubmit={(e) => { e.preventDefault(); if (demoUser) onDemo(demoUser); }}>
+            <label>Demo account<select value={demoUser} onChange={(e) => setDemoUser(e.target.value)}>
+              {users.map((user) => <option key={user} value={user}>Demo account</option>)}
+            </select></label>
+            <button type="submit" disabled={!demoUser}>Open</button>
+          </form>
+        : <p className="lede">Loading demo account...</p>}
     </section>
-    <footer>Demo ledgers are shared and resettable. Create an account to keep a watchlist that is yours alone.</footer>
+    <footer>The demo ledger is shared and resettable. Create an account to keep a watchlist that is yours alone.</footer>
   </main>;
 }
 

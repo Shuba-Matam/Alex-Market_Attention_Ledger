@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT,
   password_hash TEXT,
   google_sub TEXT,
-  is_demo INTEGER NOT NULL DEFAULT 0
+  is_demo INTEGER NOT NULL DEFAULT 0,
+  token_version INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS symbols (
   symbol TEXT PRIMARY KEY,
@@ -73,6 +74,14 @@ CREATE TABLE IF NOT EXISTS user_symbol_state (
   last_seen_at INTEGER,
   PRIMARY KEY (user_id, symbol)
 );
+CREATE TABLE IF NOT EXISTS password_resets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  code_hash TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
 """
 
 INDEXES = """
@@ -82,6 +91,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub
   ON users(google_sub) WHERE google_sub IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_time
   ON price_snapshots(symbol, provider_timestamp DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_password_resets_user
+  ON password_resets(user_id, created_at DESC);
 """
 
 
@@ -110,6 +121,7 @@ def init_db() -> None:
         migrate_conflict_columns(conn)
         migrate_add_last_polled(conn)
         migrate_add_auth_columns(conn)
+        migrate_add_token_version(conn)
         migrate_to_user_ids(conn)
         _apply(conn, INDEXES)
     finally:
@@ -202,3 +214,9 @@ def migrate_add_auth_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
     if "is_demo" not in existing:
         conn.execute("ALTER TABLE users ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0")
+
+
+def migrate_add_token_version(conn: sqlite3.Connection) -> None:
+    """Idempotent: sessions embed this counter so a password reset can revoke them."""
+    if "token_version" not in _table_columns(conn, "users"):
+        conn.execute("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")

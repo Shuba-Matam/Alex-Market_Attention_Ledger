@@ -35,6 +35,12 @@ export const api = {
     request<Session>("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }),
   loginWithGoogle: (credential: string) =>
     request<Session>("/auth/google", { method: "POST", body: JSON.stringify({ credential }) }),
+  forgotPassword: (email: string) =>
+    request<{ ok: boolean }>("/auth/forgot-password", { method: "POST", body: JSON.stringify({ email }) }),
+  resetPassword: (email: string, code: string, newPassword: string) =>
+    request<{ ok: boolean }>("/auth/reset-password", {
+      method: "POST", body: JSON.stringify({ email, code, new_password: newPassword }),
+    }),
   loginDemo: (username: string) =>
     request<Session>("/auth/demo", { method: "POST", body: JSON.stringify({ username }) }),
   authConfig: () => request<{ google_client_id: string | null }>("/auth/config"),

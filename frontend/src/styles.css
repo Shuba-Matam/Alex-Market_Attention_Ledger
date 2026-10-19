@@ -60,3 +60,11 @@
 .google-row .or{font-size:.6rem;text-transform:uppercase;letter-spacing:.08em;color:#7c8a7e}
 .google-btn{min-height:40px}
 @media(max-width:670px){.chart-head{flex-direction:column}.price-delta em{display:none}}
+
+/* --- single demo account dropdown + password reset --- */
+.demo-form{display:flex;gap:.6rem;align-items:end;flex-wrap:wrap}
+.demo-form label{display:grid;gap:.35rem}
+.demo-form select{height:2.47rem;min-width:180px;padding:.45rem;border:1px solid #95a294;background:#fbfaf4;color:#17231c;font:inherit}
+.auth-link{border:0;background:transparent;padding:.15rem 0;color:#386047;text-align:left;font-size:.66rem;text-decoration:underline}
+.auth-link:hover{background:transparent}
+.notice{color:#23734e;font-size:.68rem;line-height:1.6}

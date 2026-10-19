@@ -5,6 +5,8 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from conftest import AuthedClient
+
 from app.providers import Quote
 
 USD_TO_INR = 90.0
@@ -48,11 +50,13 @@ def test_watchlist_signals_with_live_sources(monkeypatch):
                             lambda self, symbol: _quote(1420.0, next(clock), previous_close=1400.0))
         monkeypatch.setattr(providers.TwelveDataProvider, "quote", lambda self, symbol: None)
 
-        with TestClient(app) as client:
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
             assert client.get("/health").json() == {"status": "ok"}
-            assert client.post("/watchlist/alice/symbols", json={"symbol": "reliance"}).status_code == 201
+            assert client.post("/watchlist/symbols", json={"symbol": "reliance"}).status_code == 201
             assert client.post("/poll", json={"symbol": "RELIANCE"}).status_code == 200
-            data = client.get("/watchlist/alice").json()["items"][0]
+            data = client.get("/watchlist").json()["items"][0]
             assert data["symbol"] == "RELIANCE"
             # INR prices pass through unconverted; a lone source is marked single-sourced.
             assert data["price"] == 1420.0
@@ -63,11 +67,11 @@ def test_watchlist_signals_with_live_sources(monkeypatch):
             # so the startup poller may have added one more live row.
             assert len(data["recent_prices"]) >= 9
             assert data["anomaly_zscore"] is not None
-            assert client.post("/watchlist/alice/seen").json()["marked"] == 1
+            assert client.post("/watchlist/seen").json()["marked"] == 1
             monkeypatch.setattr(providers.YahooChartProvider, "quote",
                                 lambda self, symbol: _quote(1420.0 * 1.10, next(clock)))
             client.post("/poll", json={"symbol": "RELIANCE"})
-            data = client.get("/watchlist/alice").json()["items"][0]
+            data = client.get("/watchlist").json()["items"][0]
             assert data["personal_delta_pct"] == 10.0
             assert data["flagged"] is True
 
@@ -83,14 +87,16 @@ def test_conflict_prefers_fresher_timestamp_and_records_winner(monkeypatch):
         monkeypatch.setattr(providers.YahooChartProvider, "quote", lambda self, symbol: stale_yahoo)
         monkeypatch.setattr(providers.TwelveDataProvider, "quote", lambda self, symbol: fresh_td)
 
-        with TestClient(app) as client:
-            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
+            client.post("/watchlist/symbols", json={"symbol": "RELIANCE"})
             updates = client.post("/poll", json={"symbol": "RELIANCE"}).json()["updates"][0]
             assert updates["conflict_detected"] is True
             assert updates["single_sourced"] is False
             assert updates["source_winner"] == "twelve_data"
             assert updates["price_inr"] == 102.0
-            data = client.get("/watchlist/alice").json()["items"][0]
+            data = client.get("/watchlist").json()["items"][0]
             assert data["source_winner"] == "twelve_data"
             # Section 4: both disagreeing values are exposed, not just the winner.
             assert data["conflict_other_source"] == "yahoo"
@@ -108,8 +114,10 @@ def test_agreeing_sources_are_not_a_conflict(monkeypatch):
         monkeypatch.setattr(providers.TwelveDataProvider, "quote",
                             lambda self, symbol: _quote(100.2, 1000, source="twelve_data"))  # 0.2% apart
 
-        with TestClient(app) as client:
-            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
+            client.post("/watchlist/symbols", json={"symbol": "RELIANCE"})
             updates = client.post("/poll", json={"symbol": "RELIANCE"}).json()["updates"][0]
             assert updates["conflict_detected"] is False
             assert updates["single_sourced"] is False
@@ -125,13 +133,15 @@ def test_usd_quotes_are_converted_to_inr(monkeypatch):
         monkeypatch.setattr(providers.YahooChartProvider, "quote",
                             lambda self, symbol: _quote(200.0, 1000, currency="USD"))
 
-        with TestClient(app) as client:
-            client.post("/watchlist/alice/symbols", json={"symbol": "AAPL"})
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
+            client.post("/watchlist/symbols", json={"symbol": "AAPL"})
             updates = client.post("/poll", json={"symbol": "AAPL"}).json()["updates"][0]
             assert updates["price_inr"] == 18_000.0
             assert updates["native_price"] == 200.0
             assert updates["native_currency"] == "USD"
-            data = client.get("/watchlist/alice").json()["items"][0]
+            data = client.get("/watchlist").json()["items"][0]
             assert data["price"] == 18_000.0
             assert data["price_display"] == "₹18,000.00"
 
@@ -144,8 +154,10 @@ def test_unknown_ticker_is_rejected(monkeypatch):
         _mock_fx(monkeypatch)
         monkeypatch.setattr(providers.YahooChartProvider, "quote", lambda self, symbol: None)
 
-        with TestClient(app) as client:
-            response = client.post("/watchlist/alice/symbols", json={"symbol": "NVDIA"})
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
+            response = client.post("/watchlist/symbols", json={"symbol": "NVDIA"})
             assert response.status_code == 422
 
 
@@ -153,20 +165,27 @@ def test_seeded_users_and_stats(monkeypatch):
     with _fresh_db(monkeypatch):
         from app.main import app
 
-        with TestClient(app) as client:
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
             users = client.get("/users").json()["users"]
-            assert {"demo", "aarav", "priya", "rohan"} <= set(users)
+            # /users lists demo accounts only; registered accounts are not enumerated.
+            assert set(users) == {"demo", "aarav", "priya", "rohan"}
+            assert client.username not in users
             # Seeding is idempotent.
             with TestClient(app) as again:
                 assert again.get("/users").json()["users"] == users
-            assert client.get("/stats").json()["users"] == len(users)
+            # Demo accounts plus the registered account created by this test.
+            assert client.get("/stats").json()["users"] == len(users) + 1
 
             from app import providers, service
             _mock_fx(monkeypatch)
             monkeypatch.setattr(providers.YahooChartProvider, "quote",
                                 lambda self, symbol: _quote(1420.0, 1000))
-            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
-            client.post("/watchlist/bob/symbols", json={"symbol": "RELIANCE"})
+            client.add("RELIANCE")
+            second = AuthedClient(raw_client)
+            second.as_new_user(email="bob@example.com")
+            second.add("RELIANCE")
             stats = client.get("/stats").json()
             # One symbol watched by two users counts once — dedup proof. Seeded
             # starter watchlists are deduplicated the same way.
@@ -179,10 +198,11 @@ def test_every_seeded_user_opens_with_a_watchlist(monkeypatch):
         from app.main import app
         from app.service import SEED_WATCHLISTS
 
-        with TestClient(app) as client:
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
             for username, symbols in SEED_WATCHLISTS.items():
-                items = client.get(f"/watchlist/{username}").json()["items"]
-                assert {i["symbol"] for i in items} == set(symbols)
+                client.as_demo(username)
+                assert {i["symbol"] for i in client.items()} == set(symbols)
 
 
 def test_simulated_data_never_contaminates_real_signals(monkeypatch):
@@ -197,29 +217,32 @@ def test_simulated_data_never_contaminates_real_signals(monkeypatch):
         monkeypatch.setattr(service, "SIMULATION_ENABLED", True)
         real_awake = _quote(1420.0, int(time.time()), previous_close=1400.0)
         monkeypatch.setattr(providers.YahooChartProvider, "quote", lambda self, symbol: real_awake)
-        with TestClient(app) as client:
-            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
+            client.post("/watchlist/symbols", json={"symbol": "RELIANCE"})
             for _ in range(6):
                 client.post("/poll", json={"symbol": "RELIANCE"})
-            assert client.post("/watchlist/alice/seen").json()["marked"] == 1
+            assert client.post("/watchlist/seen").json()["marked"] == 1
 
             # Market goes to sleep: simulated rows accumulate, user "sees" them.
             asleep = _quote(1420.0, int(time.time()) - 7_200)
             monkeypatch.setattr(providers.YahooChartProvider, "quote", lambda self, symbol: asleep)
             for _ in range(3):
                 client.post("/poll", json={"symbol": "RELIANCE"})
-            client.post("/watchlist/alice/seen")
+            client.post("/watchlist/seen")
 
             with connection() as conn:
                 baseline = conn.execute(
-                    "SELECT last_seen_price FROM user_symbol_state WHERE username='alice'").fetchone()["last_seen_price"]
+                    "SELECT last_seen_price FROM user_symbol_state WHERE user_id=?",
+                    (client.user_id,)).fetchone()["last_seen_price"]
             assert baseline == 1420.0  # the real close, not a simulated walk value
 
             # Market reopens with a real +10% move.
             monkeypatch.setattr(providers.YahooChartProvider, "quote",
                                 lambda self, symbol: _quote(1420.0 * 1.10, int(time.time())))
             client.post("/poll", json={"symbol": "RELIANCE"})
-            data = client.get("/watchlist/alice").json()["items"][0]
+            data = client.get("/watchlist").json()["items"][0]
             assert data["personal_delta_pct"] == 10.0
             # Prior real history is flat at 1420 -> zero deviation -> no anomaly score.
             # Contaminating it with simulated rows would manufacture a large fake z.
@@ -241,8 +264,10 @@ def test_tickers_with_spaces_are_normalized(monkeypatch):
         _mock_fx(monkeypatch)
         monkeypatch.setattr(providers.YahooChartProvider, "quote",
                             lambda self, symbol: _quote(1420.0, int(time.time())))
-        with TestClient(app) as client:
-            response = client.post("/watchlist/alice/symbols", json={"symbol": "hdfc bank"})
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
+            response = client.post("/watchlist/symbols", json={"symbol": "hdfc bank"})
             assert response.status_code == 201
             assert response.json()["symbol"] == "HDFCBANK"
 
@@ -292,8 +317,10 @@ def test_stale_provider_timestamps_cannot_hijack_latest_snapshot(monkeypatch):
         _mock_fx(monkeypatch)
         monkeypatch.setattr(providers.YahooChartProvider, "quote",
                             lambda self, symbol: _quote(1130.0, 1000))
-        with TestClient(app) as client:
-            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
+            client.post("/watchlist/symbols", json={"symbol": "RELIANCE"})
             now = int(time.time())
             with connection() as conn:
                 for i in range(100):
@@ -303,7 +330,7 @@ def test_stale_provider_timestamps_cannot_hijack_latest_snapshot(monkeypatch):
                            VALUES ('RELIANCE', 11.7, 'USD', 1105.5, 99999, ?, 'yahoo')""",
                         (now - i,))
             client.post("/poll", json={"symbol": "RELIANCE"})
-            data = client.get("/watchlist/alice").json()["items"][0]
+            data = client.get("/watchlist").json()["items"][0]
             # The newest fetch wins even though its provider timestamp is older.
             assert data["price"] == 1130.0
             with connection() as conn:
@@ -322,22 +349,28 @@ def test_market_closed_symbols_get_labelled_simulated_ticks(monkeypatch):
 
         _mock_fx(monkeypatch)
         monkeypatch.setattr(service, "SIMULATION_ENABLED", True)
-        with TestClient(app) as client:
-            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
+            client.post("/watchlist/symbols", json={"symbol": "RELIANCE"})
             # Market open: a real quote, recent timestamp.
             monkeypatch.setattr(providers.YahooChartProvider, "quote",
                                 lambda self, symbol: _quote(1420.0, int(time.time()), previous_close=1400.0))
             client.post("/poll", json={"symbol": "RELIANCE"})
-            data = client.get("/watchlist/alice").json()["items"][0]
+            data = client.get("/watchlist").json()["items"][0]
             assert data["simulated"] is False and data["source"] == "yahoo"
             baseline = data["price"]
             # Market asleep: same price, hours-old market timestamp.
             monkeypatch.setattr(providers.YahooChartProvider, "quote",
                                 lambda self, symbol: _quote(1420.0, int(time.time()) - 7_200))
             client.post("/poll", json={"symbol": "RELIANCE"})
-            data = client.get("/watchlist/alice").json()["items"][0]
+            data = client.get("/watchlist").json()["items"][0]
             assert data["simulated"] is True
             assert data["source"] == "simulated"
+            # Per-point sources ride along with the prices so the chart can
+            # split real vs simulated segments.
+            assert len(data["recent_sources"]) == len(data["recent_prices"])
+            assert data["recent_sources"][-1] == "simulated"
             # The walk starts from the last real close, not from thin air.
             assert 0.9 * baseline <= data["price"] <= 1.1 * baseline
             # Provenance must not claim live agreement or conflict for simulated rows.
@@ -358,8 +391,10 @@ def test_tickers_with_ampersand_are_valid(monkeypatch):
         _mock_fx(monkeypatch)
         monkeypatch.setattr(providers.YahooChartProvider, "quote",
                             lambda self, symbol: _quote(3200.0, int(time.time())))
-        with TestClient(app) as client:
-            response = client.post("/watchlist/alice/symbols", json={"symbol": "M&M"})
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
+            response = client.post("/watchlist/symbols", json={"symbol": "M&M"})
             assert response.status_code == 201
             assert response.json()["symbol"] == "M&M"
 
@@ -378,8 +413,10 @@ def test_backfill_and_change_only_persistence(monkeypatch):
         ts = int(time.time())
         monkeypatch.setattr(providers.YahooChartProvider, "quote",
                             lambda self, symbol: _quote(1420.0, ts, previous_close=1450.0))
-        with TestClient(app) as client:
-            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
+            client.post("/watchlist/symbols", json={"symbol": "RELIANCE"})
             client.post("/poll", json={"symbol": "RELIANCE"})
             client.post("/poll", json={"symbol": "RELIANCE"})
             with connection() as conn:
@@ -387,7 +424,7 @@ def test_backfill_and_change_only_persistence(monkeypatch):
                     "SELECT COUNT(*) AS n FROM price_snapshots WHERE symbol='RELIANCE'").fetchone()["n"]
             # 6 backfilled bars + the single live quote; identical repeats are not stored.
             assert n == 7
-            data = client.get("/watchlist/alice").json()["items"][0]
+            data = client.get("/watchlist").json()["items"][0]
             assert len(data["recent_prices"]) == 7
             assert data["previous_session_close"] == 1450.0
             assert data["anomaly_zscore"] is not None  # real history has variance
@@ -407,8 +444,10 @@ def test_simulated_rows_cannot_evict_real_history(monkeypatch):
         monkeypatch.setattr(providers.YahooChartProvider, "history", lambda self, symbol, **kwargs: list(bars))
         asleep = _quote(1420.0, int(time.time()) - 7_200)
         monkeypatch.setattr(providers.YahooChartProvider, "quote", lambda self, symbol: asleep)
-        with TestClient(app) as client:
-            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
+            client.post("/watchlist/symbols", json={"symbol": "RELIANCE"})
             for _ in range(40):
                 client.post("/poll", json={"symbol": "RELIANCE"})
             with connection() as conn:
@@ -434,15 +473,17 @@ def test_simulated_walk_anchors_to_real_history(monkeypatch):
         monkeypatch.setattr(providers.YahooChartProvider, "history", lambda self, symbol, **kwargs: list(bars))
         asleep = _quote(1420.0, int(time.time()) - 7_200)
         monkeypatch.setattr(providers.YahooChartProvider, "quote", lambda self, symbol: asleep)
-        with TestClient(app) as client:
-            client.post("/watchlist/alice/symbols", json={"symbol": "RELIANCE"})
-            data = client.get("/watchlist/alice").json()["items"][0]
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_new_user()
+            client.post("/watchlist/symbols", json={"symbol": "RELIANCE"})
+            data = client.get("/watchlist").json()["items"][0]
             assert data["simulated"] is True
             # Anchored to the real ~₹1,420 close, not the ₹100 fallback.
             assert 1_000 < data["price"] < 1_800
             for _ in range(30):
                 client.post("/poll", json={"symbol": "RELIANCE"})
-            data = client.get("/watchlist/alice").json()["items"][0]
+            data = client.get("/watchlist").json()["items"][0]
             # Mean reversion keeps a 30-tick walk within a believable band.
             assert 1_200 < data["price"] < 1_680
 
@@ -462,15 +503,18 @@ def test_seeded_watchlists_get_baselines_from_first_real_poll(monkeypatch):
         monkeypatch.setattr(providers.YahooChartProvider, "history", lambda self, symbol, **kwargs: list(bars))
         monkeypatch.setattr(providers.YahooChartProvider, "quote",
                             lambda self, symbol: _quote(1420.0, int(time.time()) - 7_200))  # asleep
-        with TestClient(app) as client:
+        with TestClient(app) as raw_client:
+            client = AuthedClient(raw_client)
+            client.as_demo("priya")
             client.post("/poll", json={"symbol": "INFY"})  # sim rows only, symbol's first data
-            data = client.get("/watchlist/priya").json()["items"][0]
+            data = next(i for i in client.items() if i["symbol"] == "INFY")
             assert data["simulated"] is True
             # Symbol's first data arrived during closure: watchers are baselined
             # from the backfilled REAL close, never from a simulated price.
             with connection() as conn:
                 baseline = conn.execute(
-                    "SELECT last_seen_price FROM user_symbol_state WHERE username='priya' AND symbol='INFY'").fetchone()["last_seen_price"]
+                    "SELECT last_seen_price FROM user_symbol_state WHERE user_id=? AND symbol='INFY'",
+                    (client.user_id,)).fetchone()["last_seen_price"]
             assert baseline == 1420.0
             sim_delta = data["personal_delta_pct"]
             assert sim_delta is not None and abs(sim_delta) < 5  # small walk deviation, real anchor
@@ -478,7 +522,7 @@ def test_seeded_watchlists_get_baselines_from_first_real_poll(monkeypatch):
             monkeypatch.setattr(providers.YahooChartProvider, "quote",
                                 lambda self, symbol: _quote(1420.0, int(time.time())))
             client.post("/poll", json={"symbol": "INFY"})
-            data = client.get("/watchlist/priya").json()["items"][0]
+            data = next(i for i in client.items() if i["symbol"] == "INFY")
             assert data["personal_delta_pct"] == 0.0  # baselined from the real close
 
 

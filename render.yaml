@@ -15,6 +15,10 @@ services:
     envVars:
       - key: TWELVE_DATA_API_KEY
         sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false   # optional; enables Google sign-in when set
+      - key: AUTH_SECRET
+        generateValue: true   # stable signing key, so redeploys keep sessions valid
       - key: ALLOWED_ORIGINS
         sync: false   # set to your deployed frontend URL, e.g. https://watchme.vercel.app
       - key: POLL_INTERVAL_SECONDS

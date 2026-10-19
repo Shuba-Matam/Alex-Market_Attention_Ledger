@@ -1,5 +1,6 @@
 backend/.venv/
 backend/watchlist.db
+backend/watchlist.db.*
 backend/__pycache__/
 backend/**/__pycache__/
 frontend/node_modules/
@@ -8,3 +9,4 @@ frontend/.npm-cache/
 .env
 backend/uvicorn.*.log
 backend/.pytest_cache/
+backend/auth_secret.key

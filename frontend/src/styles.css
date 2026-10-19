@@ -12,5 +12,51 @@
 .sim{color:#4a3a78;background:#e2dcf3}
 .sim-note{color:#4a3a78}
 .digest{color:#27392e;font-weight:600}
+.email-auth{display:grid;gap:.6rem;margin-top:1.2rem;border:1px solid #607060;background:rgba(250,249,243,.55);padding:1rem}
+.email-auth form{display:grid;grid-template-columns:1fr 1fr auto;gap:.6rem;align-items:end}
+.email-auth label{display:grid;gap:.35rem}
+.email-auth .auth-buttons{display:flex;gap:.4rem}
+.email-auth small{font-size:.61rem;color:#667467;line-height:1.6}
+@media(max-width:670px){.email-auth form{grid-template-columns:1fr}.email-auth .auth-buttons button{flex:1}}
 .history-chart{margin:.4rem 0 1rem;border:1px dashed #bac1b7;background:#fbfaf4;padding:.4rem 0}
 .no-history{font-size:.64rem;color:#7a8578;margin:.6rem;padding:.4rem 0}
+
+/* --- last-checked stamp (welcome screen) --- */
+.last-checked{display:flex;flex-wrap:wrap;align-items:baseline;gap:.5rem;margin:1.3rem 0 0;font-size:.72rem;color:#3c4a40}
+.last-checked strong{color:#1d2f24}
+.last-checked .stamp{font-size:.6rem;color:#6f7d70;border-left:1px solid #b9c0b4;padding-left:.5rem}
+.picker-note{grid-column:1/-1;margin:0 0 .2rem;font-size:.62rem;letter-spacing:.05em;text-transform:uppercase;color:#6f7d70}
+
+/* --- per-row percentage change --- */
+.price{display:grid;gap:.22rem}
+.price-now{font-size:.92rem}
+.price-delta{font-size:.61rem;letter-spacing:.02em}
+.price-delta em{font-style:normal;color:#7c8a7e;letter-spacing:.04em}
+.price-delta.positive{color:#23734e}
+.price-delta.negative{color:#ad4434}
+.price-delta.flat{color:#6f7d70}
+.flat{color:#6f7d70}
+
+/* --- chart header: readout + legend (top right) --- */
+.chart-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;padding:.55rem .7rem .2rem;flex-wrap:wrap}
+.chart-readout{display:flex;gap:1.1rem;flex-wrap:wrap;align-items:baseline}
+.chart-readout span{display:grid;gap:.12rem}
+.chart-readout em{font-style:normal;font-size:.56rem;text-transform:uppercase;letter-spacing:.07em;color:#7c8a7e}
+.chart-readout strong{font-size:.86rem;color:#1d2f24}
+.chart-move{align-self:center;font-size:.8rem;font-weight:600}
+.chart-legend{display:flex;gap:.75rem;flex-wrap:wrap;list-style:none;margin:0;padding:0;font-size:.6rem;color:#596759}
+.chart-legend li{display:flex;align-items:center;gap:.3rem;white-space:nowrap}
+.swatch{width:14px;height:0;border-top-width:2px;border-top-style:solid;display:inline-block}
+.swatch.live{border-top-color:#24734f}
+.swatch.sim{border-top-color:#4a3a78;border-top-style:dashed}
+.swatch.seen{border-top-color:#8a6d1f;border-top-style:dashed}
+
+/* --- hover tooltip --- */
+.chart-tip{display:grid;gap:.18rem;background:#fbfaf4;border:1px solid #607060;padding:.45rem .6rem;font-size:.62rem;color:#3c4a40;box-shadow:2px 2px 0 rgba(32,59,46,.12)}
+.chart-tip strong{font-size:.8rem;color:#1d2f24}
+
+/* --- google sign-in row --- */
+.google-row{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap}
+.google-row .or{font-size:.6rem;text-transform:uppercase;letter-spacing:.08em;color:#7c8a7e}
+.google-btn{min-height:40px}
+@media(max-width:670px){.chart-head{flex-direction:column}.price-delta em{display:none}}

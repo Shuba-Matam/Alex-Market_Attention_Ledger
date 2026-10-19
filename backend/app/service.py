@@ -7,6 +7,7 @@ import time
 from typing import Optional
 
 from .db import connection
+from . import auth
 from .providers import (
     FxRateProvider,
     Quote,
@@ -61,7 +62,7 @@ def normalize_symbol(symbol: str) -> str:
 DEMO_USERS = ("demo", "aarav", "priya", "rohan")
 
 # Starter watchlists so every seeded account opens with something to look at.
-# Seeded once, only when the user has no items — never overrides user edits.
+# Seeded once, only when the user has no items - never overrides user edits.
 SEED_WATCHLISTS = {
     "demo": ("INFY", "RELIANCE", "TCS"),
     "aarav": ("TCS", "HDFCBANK", "TATASTEEL", "AAPL"),
@@ -71,23 +72,133 @@ SEED_WATCHLISTS = {
 
 
 def seed_users() -> None:
-    """Dummy accounts (no credentials by design) plus a starter watchlist each."""
+    """Demo accounts plus a starter watchlist each. They are flagged is_demo=1:
+    anyone may open one through /auth/demo, but only by being issued a real
+    token, so every request downstream is authenticated the same way."""
     now = int(time.time())
     with connection() as conn:
         for username, symbols in SEED_WATCHLISTS.items():
-            conn.execute("INSERT OR IGNORE INTO users(username, created_at) VALUES (?, ?)", (username, now))
-            has_items = conn.execute("SELECT 1 FROM watchlist_items WHERE username=? LIMIT 1", (username,)).fetchone()
+            conn.execute(
+                "INSERT OR IGNORE INTO users(username, created_at, is_demo) VALUES (?, ?, 1)",
+                (username, now))
+            user_id = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()["id"]
+            has_items = conn.execute("SELECT 1 FROM watchlist_items WHERE user_id=? LIMIT 1", (user_id,)).fetchone()
             if has_items:
                 continue
             for symbol in symbols:
                 conn.execute("INSERT OR IGNORE INTO symbols(symbol, created_at) VALUES (?, ?)", (symbol, now))
-                conn.execute("INSERT OR IGNORE INTO watchlist_items(username, symbol, created_at) VALUES (?, ?, ?)",
-                             (username, symbol, now))
+                conn.execute("INSERT OR IGNORE INTO watchlist_items(user_id, symbol, created_at) VALUES (?, ?, ?)",
+                             (user_id, symbol, now))
 
 
 def list_users() -> list[str]:
+    """Demo accounts only. Registered users are never enumerated: the login
+    screen must not become a directory of who has an account here."""
     with connection() as conn:
-        return [row["username"] for row in conn.execute("SELECT username FROM users ORDER BY created_at, username")]
+        return [row["username"] for row in conn.execute(
+            "SELECT username FROM users WHERE is_demo=1 ORDER BY created_at, username")]
+
+
+class AuthError(Exception):
+    """Raised for registration/login failures; message is safe to show."""
+
+
+def _unique_username(conn, base: str) -> str:
+    username, suffix = base, 2
+    while conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+        username, suffix = f"{base[:13]}{suffix}", suffix + 1
+    return username
+
+
+def _session(row) -> dict:
+    return {"user_id": row["id"], "username": row["username"], "token": auth.make_token(row["id"])}
+
+
+def register_user(email: str, password: str) -> dict:
+    """Create an email-login account and return a session."""
+    email = (email or "").strip().lower()
+    if not auth.valid_email(email):
+        raise AuthError("enter a valid email address")
+    if len(password or "") < auth.MIN_PASSWORD_LENGTH:
+        raise AuthError(f"password must be at least {auth.MIN_PASSWORD_LENGTH} characters")
+    now = int(time.time())
+    with connection() as conn:
+        if conn.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
+            raise AuthError("an account with this email already exists")
+        username = _unique_username(conn, auth.username_from_email(email))
+        cursor = conn.execute(
+            "INSERT INTO users(username, created_at, email, password_hash) VALUES (?, ?, ?, ?)",
+            (username, now, email, auth.hash_password(password)))
+        return {"user_id": cursor.lastrowid, "username": username,
+                "token": auth.make_token(cursor.lastrowid)}
+
+
+def login_user(email: str, password: str) -> dict:
+    email = (email or "").strip().lower()
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT id, username, password_hash FROM users WHERE email=? AND is_demo=0", (email,)).fetchone()
+        if row is None or not auth.verify_password(password or "", row["password_hash"]):
+            raise AuthError("wrong email or password")
+        return _session(row)
+
+
+def login_demo(username: str) -> dict:
+    """Issue a real session for a seeded demo account."""
+    with connection() as conn:
+        row = conn.execute("SELECT id, username FROM users WHERE username=? AND is_demo=1", (username,)).fetchone()
+        if row is None:
+            raise AuthError("unknown demo account")
+        return _session(row)
+
+
+def login_with_google(credential: str) -> dict:
+    """Verify a Google ID token, then link it to an account by Google subject
+    first and verified email second, so an existing password account gains
+    Google as an additional sign-in method instead of a duplicate ledger."""
+    try:
+        claims = auth.verify_google_id_token(credential)
+    except ValueError as error:
+        raise AuthError(str(error)) from error
+    now = int(time.time())
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT id, username FROM users WHERE google_sub=? AND is_demo=0", (claims["sub"],)).fetchone()
+        if row:
+            return _session(row)
+        existing = conn.execute(
+            "SELECT id, username FROM users WHERE email=? AND is_demo=0", (claims["email"],)).fetchone()
+        if existing:
+            conn.execute("UPDATE users SET google_sub=? WHERE id=?", (claims["sub"], existing["id"]))
+            return _session(existing)
+        username = _unique_username(conn, auth.username_from_email(claims["email"]))
+        cursor = conn.execute(
+            "INSERT INTO users(username, created_at, email, google_sub) VALUES (?, ?, ?, ?)",
+            (username, now, claims["email"], claims["sub"]))
+        return {"user_id": cursor.lastrowid, "username": username,
+                "token": auth.make_token(cursor.lastrowid)}
+
+
+def user_by_id(user_id: int) -> Optional[dict]:
+    """Resolve a token subject to an account, or None if it no longer exists."""
+    with connection() as conn:
+        row = conn.execute("SELECT id, username, is_demo FROM users WHERE id=?", (user_id,)).fetchone()
+    if row is None:
+        return None
+    return {"user_id": row["id"], "username": row["username"], "is_demo": bool(row["is_demo"])}
+
+
+def user_watchlist_symbols(user_id: int) -> list[str]:
+    with connection() as conn:
+        return [row["symbol"] for row in conn.execute(
+            "SELECT symbol FROM watchlist_items WHERE user_id=? ORDER BY symbol", (user_id,))]
+
+
+def user_owns_symbol(user_id: int, symbol: str) -> bool:
+    """Guards per-symbol polling: a caller may only refresh what they watch."""
+    with connection() as conn:
+        return conn.execute("SELECT 1 FROM watchlist_items WHERE user_id=? AND symbol=?",
+                            (user_id, normalize_symbol(symbol))).fetchone() is not None
 
 
 def stats() -> dict:
@@ -98,19 +209,20 @@ def stats() -> dict:
     return {"unique_symbols": symbols, "users": users}
 
 
-def add_symbol(username: str, symbol: str) -> str:
+def add_symbol(user_id: int, symbol: str) -> str:
+    """Add a symbol to an existing account's watchlist. The account is never
+    created here: callers are already authenticated, and auto-creating a user
+    from a write was what previously allowed unauthenticated ledgers."""
     symbol = normalize_symbol(symbol)
-    if not username.strip():
-        raise ValueError("username is required")
     now = int(time.time())
     with connection() as conn:
-        conn.execute("INSERT OR IGNORE INTO users(username, created_at) VALUES (?, ?)", (username, now))
         conn.execute("INSERT OR IGNORE INTO symbols(symbol, created_at) VALUES (?, ?)", (symbol, now))
-        conn.execute("INSERT OR IGNORE INTO watchlist_items(username, symbol, created_at) VALUES (?, ?, ?)", (username, symbol, now))
+        conn.execute("INSERT OR IGNORE INTO watchlist_items(user_id, symbol, created_at) VALUES (?, ?, ?)",
+                     (user_id, symbol, now))
     return symbol
 
 
-def initialize_seen_price(username: str, symbol: str) -> None:
+def initialize_seen_price(user_id: int, symbol: str) -> None:
     """Set a first baseline (in INR) only when this user has never seen this symbol.
     Baselines come from real quotes only — a simulated price must never become
     the reference a future real move is measured against."""
@@ -123,23 +235,24 @@ def initialize_seen_price(username: str, symbol: str) -> None:
         ).fetchone()
         if price and price["price_inr"] is not None:
             conn.execute(
-                """INSERT OR IGNORE INTO user_symbol_state(username, symbol, last_seen_price, last_seen_at)
+                """INSERT OR IGNORE INTO user_symbol_state(user_id, symbol, last_seen_price, last_seen_at)
                    VALUES (?, ?, ?, ?)""",
-                (username, symbol, price["price_inr"], now),
+                (user_id, symbol, price["price_inr"], now),
             )
 
 
-def remove_symbol(username: str, symbol: str) -> bool:
+def remove_symbol(user_id: int, symbol: str) -> bool:
     with connection() as conn:
-        return conn.execute("DELETE FROM watchlist_items WHERE username=? AND symbol=?", (username, normalize_symbol(symbol))).rowcount > 0
+        return conn.execute("DELETE FROM watchlist_items WHERE user_id=? AND symbol=?",
+                            (user_id, normalize_symbol(symbol))).rowcount > 0
 
 
 def _baseline_all_watchers(conn, symbol: str, price: float, now: int) -> None:
     """Give every user watching `symbol` a personal baseline (only fills users
     without one), so seeded starter watchlists show personal deltas without
     requiring a manual 'mark seen' click first."""
-    conn.execute("""INSERT OR IGNORE INTO user_symbol_state(username, symbol, last_seen_price, last_seen_at)
-                 SELECT w.username, w.symbol, ?, ? FROM watchlist_items w WHERE w.symbol=?""",
+    conn.execute("""INSERT OR IGNORE INTO user_symbol_state(user_id, symbol, last_seen_price, last_seen_at)
+                 SELECT w.user_id, w.symbol, ?, ? FROM watchlist_items w WHERE w.symbol=?""",
                  (price, now, symbol))
 
 
@@ -335,13 +448,13 @@ def _signal(row, snapshots: list) -> dict:
             "flagged": flagged, "data_age_seconds": age, "is_stale": age > STALE_AFTER_SECONDS}
 
 
-def watchlist(username: str) -> list[dict]:
+def watchlist(user_id: int) -> list[dict]:
     with connection() as conn:
         items = conn.execute("""SELECT w.symbol, s.last_polled_at, state.last_seen_price, state.last_seen_at
                              FROM watchlist_items w
-                             LEFT JOIN user_symbol_state state ON state.username=w.username AND state.symbol=w.symbol
+                             LEFT JOIN user_symbol_state state ON state.user_id=w.user_id AND state.symbol=w.symbol
                              LEFT JOIN symbols s ON s.symbol=w.symbol
-                             WHERE w.username=? ORDER BY w.symbol""", (username,)).fetchall()
+                             WHERE w.user_id=? ORDER BY w.symbol""", (user_id,)).fetchall()
         result = []
         for item in items:
             # Latest *fetch* wins, not the provider's event time: provider timestamps
@@ -354,9 +467,12 @@ def watchlist(username: str) -> list[dict]:
                                "provider_timestamp": None, "candidate_sources": [], "conflict_detected": False,
                                "single_sourced": True, "conflict_other_source": None,
                                "conflict_other_price_inr": None, "simulated": False,
-                               "recent_prices": [], "personal_delta_pct": None,
+                               "recent_prices": [], "recent_sources": [], "personal_delta_pct": None,
                                "anomaly_zscore": None, "volume_spike_ratio": None, "flagged": False,
-                               "data_age_seconds": None, "is_stale": True})
+                               "data_age_seconds": None, "is_stale": True,
+                               "last_seen_price": item["last_seen_price"],
+                               "last_seen_price_display": format_inr(item["last_seen_price"]),
+                               "last_seen_at": item["last_seen_at"]})
                 continue
             latest = snapshots[0]
             # Prefer the provider's own previous-session close; fall back to a snapshot
@@ -383,22 +499,29 @@ def watchlist(username: str) -> list[dict]:
                            "conflict_other_source": latest["conflict_other_source"] or None,
                            "conflict_other_price_inr": latest["conflict_other_price_inr"],
                            "recent_prices": list(reversed([r["price_inr"] for r in snapshots])),
+                           "recent_sources": list(reversed([r["source"] for r in snapshots])),
                            "previous_session_close": previous_close,
                            "previous_session_close_display": format_inr(previous_close),
                            "previous_session_delta_pct": previous_delta,
+                           "last_seen_price": item["last_seen_price"],
+                           "last_seen_price_display": format_inr(item["last_seen_price"]),
+                           "last_seen_at": item["last_seen_at"],
+                           "history": [{"t": r["provider_timestamp"], "price": r["price_inr"],
+                                        "source": r["source"]}
+                                       for r in reversed(snapshots)],
                            **_signal(item, snapshots)})
     return sorted(result, key=lambda x: (not x["flagged"], x["symbol"]))
 
 
-def mark_seen(username: str) -> int:
+def mark_seen(user_id: int) -> int:
     now = int(time.time())
     with connection() as conn:
         rows = conn.execute("""SELECT w.symbol, (SELECT price_inr FROM price_snapshots p WHERE p.symbol=w.symbol
                             AND p.source!='simulated'
-                            ORDER BY fetched_at DESC, id DESC LIMIT 1) AS price FROM watchlist_items w WHERE w.username=?""", (username,)).fetchall()
+                            ORDER BY fetched_at DESC, id DESC LIMIT 1) AS price FROM watchlist_items w WHERE w.user_id=?""", (user_id,)).fetchall()
         for row in rows:
             if row["price"] is not None:
-                conn.execute("""INSERT INTO user_symbol_state(username,symbol,last_seen_price,last_seen_at) VALUES(?,?,?,?)
-                                ON CONFLICT(username,symbol) DO UPDATE SET last_seen_price=excluded.last_seen_price,last_seen_at=excluded.last_seen_at""",
-                             (username, row["symbol"], row["price"], now))
+                conn.execute("""INSERT INTO user_symbol_state(user_id,symbol,last_seen_price,last_seen_at) VALUES(?,?,?,?)
+                                ON CONFLICT(user_id,symbol) DO UPDATE SET last_seen_price=excluded.last_seen_price,last_seen_at=excluded.last_seen_at""",
+                             (user_id, row["symbol"], row["price"], now))
     return len(rows)

@@ -6,7 +6,7 @@ An attention-first market watchlist built for Groww Code 2026. It answers **what
 
 ## Screenshots
 
-**Login** — pick an account; state persists per user, across sessions and devices.
+**Login** — create an account with email or Google, or open a shared demo ledger; state persists per user across sessions and devices.
 
 ![Login](screenshots/01-login.png)
 
@@ -32,7 +32,7 @@ An attention-first market watchlist built for Groww Code 2026. It answers **what
 
 ## Run it
 
-**Hosted (no setup):** open [alex-market-attention-ledger.vercel.app](https://alex-market-attention-ledger.vercel.app), pick any account on the login screen, and you're in. The first load after inactivity may take ~30 seconds (free-tier server waking up). If markets are closed, rows are honestly labelled `SIMULATED` — prices, personal deltas, and charts still work; during market hours you'll see live prices. The API and its docs live at [alex-watchlist-api.onrender.com/docs](https://alex-watchlist-api.onrender.com/docs).
+**Hosted (no setup):** open [alex-market-attention-ledger.vercel.app](https://alex-market-attention-ledger.vercel.app) and create an account with email or Google, or open one of the shared demo ledgers. Registered watchlists are private to the signed-in account; demo ledgers are shared and resettable. The first load after inactivity may take ~30 seconds (free-tier server waking up). If markets are closed, rows are honestly labelled `SIMULATED` — prices, personal deltas, and charts still work; during market hours you'll see live prices. The API and its docs live at [alex-watchlist-api.onrender.com/docs](https://alex-watchlist-api.onrender.com/docs).
 
 **Locally:**
 
@@ -62,8 +62,8 @@ $env:TWELVE_DATA_API_KEY="your-key"
 
 ## Deploy
 
-- **Backend**: `render.yaml` deploys to Render's free tier. Two documented caveats: free-tier services sleep after ~15 minutes without traffic (the background poller only runs while awake — expect a ~30s cold start), and SQLite sits on an ephemeral disk, so data survives restarts but resets on redeploy. Set `TWELVE_DATA_API_KEY` and `ALLOWED_ORIGINS` (the frontend URL, comma-separated) in the dashboard.
-- **Frontend**: Vercel/Netlify, root directory `frontend/`, with `VITE_API_BASE` set to the backend URL at build time (see `frontend/.env.example`).
+- **Backend**: `render.yaml` deploys to Render's free tier. Caveats: free-tier services sleep after ~15 minutes without traffic (the background poller only runs while awake — expect a ~30s cold start), and SQLite sits on an ephemeral disk, so data survives restarts but resets on redeploy. `AUTH_SECRET` is generated once by Render and kept, so redeploys do not sign everyone out. Set `TWELVE_DATA_API_KEY`, `ALLOWED_ORIGINS` (the frontend URL, comma-separated), and optionally `GOOGLE_CLIENT_ID` in the dashboard.
+- **Frontend**: Vercel/Netlify, root directory `frontend/`, with `VITE_API_BASE` set to the backend URL at build time (see `frontend/.env.example`). `VITE_GOOGLE_CLIENT_ID` is optional; the backend normally supplies the ID through `/auth/config`.
 
 ## Verification
 
@@ -83,7 +83,7 @@ Tests mock both providers at the boundary (no network) and include regression te
 
 **Storing less, more honestly.** Snapshots are persisted only when the market event changes; feed freshness lives in `symbols.last_polled_at`, so a stable market is never mistaken for a broken feed.
 
-**No passwords.** Login is a picker over seeded accounts — the thing being demonstrated is per-user state persistence, not access control. Real auth would be OAuth or magic links in front of the same username-scoped data model; nothing in the backend changes.
+**Real accounts, minimal surface.** Registration and email/password sign-in use scrypt hashes with per-user salts; sessions are HMAC-signed 30-day tokens whose subject is the immutable `users.id`, so a rename cannot re-point a session at another ledger. Repeated failed sign-ins are throttled per IP + email (8 failures / 15 minutes). Google Sign-In verifies the ID token audience and requires a verified email before issuing a session; demo accounts are passwordless but still token-authenticated. Tokens live in `localStorage` (readable by XSS) — an httpOnly cookie is the next hardening step. Password reset, email verification, and distributed rate limiting are deliberately not built for this demo.
 
 **No AI feature.** Every signal is deterministic and auditable. The UI shows the exact threshold that caused a flag, avoiding opaque or investment-advice-like recommendations.
 
